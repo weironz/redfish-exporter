@@ -14,4 +14,14 @@ The B300 exporter v0.2.0 reported 10 NVMe *links* but only 7 readable drive deta
 
 The existing Python B300 exporter was actively monitored by Prometheus for all 32 B300s. It was stopped only during the two B300 canaries and restarted in a `finally` block each time. After each restart, Prometheus returned to 32/32 B300 targets `up`; no legacy container or configuration was replaced. The two CPU canaries did not require changing the old collector.
 
-Follow-up before rollout: diagnose the B300 drive-detail timeouts during a coordinated maintenance/canary window, verify v0.2.1 against one B300 without overlapping the old collector, and repeat CPU canaries if firmware versions differ from these samples. Monitor scrape duration against the suggested 150-second timeout, especially ASRockRack 1U.
+Follow-up before rollout: determine why the B300 Drive detail endpoints time out, and repeat CPU canaries if firmware versions differ from these samples. Monitor scrape duration against the suggested 150-second timeout, especially ASRockRack 1U.
+
+## v0.2.1 B300 retest and latest legacy collector state
+
+At the user's request, the legacy `b300-redfish-exporter` container was manually stopped and must **remain stopped until the user explicitly asks to restart it**. Docker reports `status=exited`, with `restart=unless-stopped`; the new Rust exporter is not deployed to IDC. This intentionally suspends the legacy B300 Redfish monitoring for the 32 targets; Prometheus `down` results caused by the stopped exporter must not be interpreted as 32 BMC hardware failures.
+
+One local v0.2.1 canary against B300-10 took 104.44 seconds and emitted 409 samples: `redfish_up=1`, `redfish_blocked=0`, `redfish_scrape_complete=0`, `redfish_scrape_errors=3`, `redfish_gpu_count=8`, and `redfish_gpu_online_count=8`. GPU temperature, power and ECC series were present for all eight GPUs. As intended, `redfish_nvme_drive_count` was absent because the drive scan was incomplete.
+
+A separate sequential GET check of the 10 advertised NVMe Drive links found that devices 0–6 responded, while `NVMe_Device7_NSID1`, `NVMe_Device8_NSID1` and `NVMe_Device9_NSID1` timed out. Their parent `StorageUnit_A/B/C` objects in the expanded Storage collection each reported `Status.State=Enabled` and `Status.Health=OK`, with one Drive link. Parent status does **not** prove that the individual drives are healthy or present; the supported conclusion is that these three Drive detail endpoints did not respond within 15 seconds. No power, reset, console or configuration action was attempted.
+
+The originally listed follow-up to verify v0.2.1 against one B300 is now done; the remaining blocker to a fully complete B300 scrape is the three BMC Drive detail timeouts. Do not suppress those errors or report a fabricated NVMe count merely to make the scrape appear complete.
