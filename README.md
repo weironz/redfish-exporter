@@ -1,6 +1,6 @@
 # redfish-exporter
 
-Independent, read-only Rust Prometheus exporter for NVIDIA B300/HGX BMC Redfish telemetry. It runs on an IDC management host, outside the rented GPU server OS. It does not perform Redfish writes, power operations, firmware updates, or console probing.
+Independent, read-only Rust Prometheus exporter for three server families: ASRockRack 8U16X-GNR2 B300, TYAN B8037T73X4-200PE4HR-L, and ASRockRack 1U10E-ICX2. It runs on an IDC management host, outside the rented server OS. It does not perform Redfish writes, power operations, firmware updates, or console probing.
 
 ## Why separate from NeoStor Agent
 
@@ -19,7 +19,7 @@ No new IDC inbound firewall port is required. `node_exporter` and DCGM are optio
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-docker build -t redfish-exporter:v0.1.0 .
+docker build -t redfish-exporter:v0.2.0 .
 ```
 
 The container image is built locally; this repository does not automatically publish or deploy it. NeoStor's optional Compose `redfish` profile can reference a version-pinned image from an approved registry or a locally loaded image.
@@ -27,6 +27,16 @@ The container image is built locally; this repository does not automatically pub
 ## Configuration
 
 Create a private `redfish-targets.json` on the IDC management host from [the example](examples/redfish-targets.example.json). The `target` URL parameter is an alias in this file, never an arbitrary URL or IP. Use a `0700` parent directory and a `0600` file. Do not commit, log, or send BMC credentials to NeoStor's monitoring configuration. The exporter accepts only preconfigured private IPv4 BMC addresses over HTTPS; set `insecure_tls: true` only for BMCs with self-signed certificates.
+
+Select a versioned profile per target. `profile` is an exact allowlisted value, not a user-supplied Redfish path. Existing B300 target files without `profile` continue to use `asrockrack_b300_8u16x`; set it explicitly for new targets. The model label in `redfish_target_info` describes this configured profile, not an independently verified asset identity. Inventory remains the source of truth for the exact machine model; verify the mapping before enrollment.
+
+| Profile | Historically surveyed resource family | Collection strategy |
+| --- | --- | --- |
+| `asrockrack_b300_8u16x` | `/Systems/System_0`, `/Managers/BMC_0`, HGX | Existing B300-specific paths and telemetry reports |
+| `tyan_b8037` | `/Systems/Self`, `/Managers/Self`, `/Chassis/Self` | Follow advertised collection links, fetch members individually; no `$expand` |
+| `asrockrack_1u10e` | `/Systems/Self`, `/Managers/Self`, `/Chassis/Self` | Follow advertised collection links plus Thermal, Power and Sensors when present; no `$expand` |
+
+Both CPU profiles collect system/chassis health, power state, CPU/DIMM inventory, storage and NIC details when the BMC advertises them. Thermal, PSU and sensor metrics appear only for advertised, successfully read resources. Missing links do not become zeros. No CPU model is queried for HGX/GPU endpoints. Profile differences and paths are grounded in the existing read-only capability surveys; real output values still require one authorized canary per model and firmware version.
 
 Environment variables:
 
@@ -39,8 +49,9 @@ Endpoints: `/healthz` and `/metrics?target=B300-01`. Unknown targets return 404;
 
 ## Safety and metric semantics
 
-- Reads use fixed Redfish paths and GET only, one request at a time per BMC. A 403 triggers 180–1800 seconds of quiet backoff; timeouts also back off. Never run this exporter and the legacy Python exporter against the same BMC concurrently. First exclude one canary BMC from the old collector, then validate and expand gradually.
+- Reads use profile-selected paths and validated same-origin Redfish links, GET only, one request at a time per BMC, at most 96 requests per scrape. CPU member collections are bounded and deliberately do not use `$expand`; an oversized/paginated collection is reported incomplete rather than counted as zero. A 403 triggers 180–1800 seconds of quiet backoff; timeouts also back off. Never run this exporter and the legacy Python exporter against the same BMC concurrently. First exclude one canary BMC from the old collector, then validate and expand gradually.
 - `redfish_gpu_count` is the number of enumerated slots. Use `redfish_gpu_online_count` and per-GPU `redfish_gpu_online` for card presence. Missing component data is omitted rather than reported as zero or replayed as a fresh sample. `redfish_scrape_complete` and `redfish_scrape_errors` describe partial failures.
+- `redfish_target_info{profile,model,device_type}` carries bounded configured model metadata for dashboard grouping. New CPU metrics include `redfish_chassis_health`, `redfish_chassis_power_watts`, `redfish_psu_*`, and `redfish_sensor_*`; numeric sensor readings are exported only when their units are known. `redfish_up=0` means the profile's system probe did not succeed, including HTTP 404 from a wrong profile.
 - Hardware metrics include system power/health, CPU, DIMM, NVMe, NIC, fan, physical temperature, PCIe, HGX board/power, GPU temperature/power and ECC/row-remap counters. The exporter filters AMI `TEMP_CPU`, `FSC`, `Tlimit`, and `Tcontrol` pseudo-temperature fields.
 - Redfish does not reliably expose GPU utilization, processes, Xid, NVLink/NVSwitch bandwidth, or IB fabric congestion. These must remain unavailable unless an authorized additional source supplies them; absence does not mean healthy or zero.
 

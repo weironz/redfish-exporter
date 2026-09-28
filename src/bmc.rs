@@ -12,6 +12,50 @@ use tokio::sync::{Mutex, Semaphore};
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const BACKOFF_BASE: u64 = 180;
 const BACKOFF_MAX: u64 = 1800;
+const MAX_REQUESTS_PER_SCRAPE: usize = 96;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+enum Profile {
+    #[default]
+    #[serde(rename = "asrockrack_b300_8u16x")]
+    AsrockrackB3008u16x,
+    #[serde(rename = "tyan_b8037")]
+    TyanB8037,
+    #[serde(rename = "asrockrack_1u10e")]
+    Asrockrack1u10e,
+}
+
+impl Profile {
+    fn id(self) -> &'static str {
+        match self {
+            Self::AsrockrackB3008u16x => "asrockrack_b300_8u16x",
+            Self::TyanB8037 => "tyan_b8037",
+            Self::Asrockrack1u10e => "asrockrack_1u10e",
+        }
+    }
+
+    fn model(self) -> &'static str {
+        match self {
+            Self::AsrockrackB3008u16x => "8U16X-GNR2",
+            Self::TyanB8037 => "B8037T73X4-200PE4HR-L",
+            Self::Asrockrack1u10e => "1U10E-ICX2",
+        }
+    }
+
+    fn device_type(self) -> &'static str {
+        match self {
+            Self::AsrockrackB3008u16x => "gpu_server",
+            Self::TyanB8037 | Self::Asrockrack1u10e => "cpu_server",
+        }
+    }
+
+    fn system_path(self) -> &'static str {
+        match self {
+            Self::AsrockrackB3008u16x => "/redfish/v1/Systems/System_0",
+            Self::TyanB8037 | Self::Asrockrack1u10e => "/redfish/v1/Systems/Self",
+        }
+    }
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +65,9 @@ pub struct TargetConfig {
     password: String,
     #[serde(default)]
     insecure_tls: bool,
+    /// Legacy files without a profile remain B300-only. Other models must opt in.
+    #[serde(default)]
+    profile: Profile,
 }
 
 #[derive(Default)]
@@ -38,6 +85,7 @@ pub struct Target {
     client: reqwest::Client,
     pub scrape_lock: Mutex<()>,
     circuit: Mutex<Circuit>,
+    profile: Profile,
 }
 
 #[derive(Debug)]
@@ -92,17 +140,24 @@ impl Target {
             client,
             scrape_lock: Mutex::new(()),
             circuit: Mutex::new(Circuit::default()),
+            profile: config.profile,
         })
     }
 
     #[cfg(test)]
     fn mock(base: &str) -> Self {
+        Self::mock_profile(base, Profile::AsrockrackB3008u16x)
+    }
+
+    #[cfg(test)]
+    fn mock_profile(base: &str, profile: Profile) -> Self {
         Self::with_base(
             TargetConfig {
                 address: "10.0.0.1".into(),
                 username: "test".into(),
                 password: "secret".into(),
                 insecure_tls: false,
+                profile,
             },
             reqwest::Url::parse(base).expect("mock URL"),
         )
@@ -219,6 +274,8 @@ pub struct Collection {
     pub up: bool,
     pub blocked: bool,
     pub errors: u32,
+    requests: usize,
+    budget_exhausted: bool,
 }
 
 impl Collection {
@@ -228,6 +285,8 @@ impl Collection {
             up: false,
             blocked: false,
             errors: 1,
+            requests: 0,
+            budget_exhausted: false,
         }
     }
 
@@ -241,6 +300,14 @@ impl Collection {
         if self.blocked {
             return None;
         }
+        if self.requests >= MAX_REQUESTS_PER_SCRAPE {
+            if !self.budget_exhausted {
+                self.errors = self.errors.saturating_add(1);
+                self.budget_exhausted = true;
+            }
+            return None;
+        }
+        self.requests += 1;
         match target.get(path, inflight).await {
             Ok(value) => Some(value),
             Err(error) => {
@@ -258,6 +325,144 @@ impl Collection {
             }
         }
     }
+
+    async fn fetch_members(
+        &mut self,
+        name: &str,
+        target: &Target,
+        inflight: &Semaphore,
+        path: &str,
+        limit: usize,
+    ) -> Option<Vec<Value>> {
+        let collection = self.fetch(name, target, inflight, path).await?;
+        let Some(members) = collection["Members"].as_array() else {
+            self.errors = self.errors.saturating_add(1);
+            return None;
+        };
+        if members.len() > limit
+            || !collection["Members@odata.nextLink"].is_null()
+            || collection["Members@odata.count"]
+                .as_u64()
+                .is_some_and(|count| count != members.len() as u64)
+        {
+            self.errors = self.errors.saturating_add(1);
+            return None;
+        }
+        let paths = refs(&collection, "Members", limit);
+        if paths.len() != members.len() {
+            self.errors = self.errors.saturating_add(1);
+            return None;
+        }
+        let mut values = Vec::with_capacity(paths.len());
+        for path in paths {
+            values.push(self.fetch(name, target, inflight, &path).await?);
+        }
+        Some(values)
+    }
+
+    fn advertised_link(&mut self, value: &Value, key: &str) -> Option<String> {
+        let advertised = value.get(key).filter(|value| !value.is_null())?;
+        match advertised["@odata.id"].as_str() {
+            Some(path) if safe_path(path) => Some(path.to_owned()),
+            _ => {
+                self.errors = self.errors.saturating_add(1);
+                None
+            }
+        }
+    }
+}
+
+async fn collect_cpu(
+    name: &str,
+    target: &Target,
+    inflight: &Semaphore,
+    out: &mut Collection,
+    system: &Value,
+) {
+    if let Some(path) = out.advertised_link(system, "Processors") {
+        if let Some(items) = out.fetch_members(name, target, inflight, &path, 8).await {
+            metrics::processors(&mut out.samples, &serde_json::json!({"Members": items}));
+        }
+    }
+    if let Some(path) = out.advertised_link(system, "Memory") {
+        if let Some(items) = out.fetch_members(name, target, inflight, &path, 64).await {
+            metrics::memory(&mut out.samples, &serde_json::json!({"Members": items}));
+        }
+    }
+    if let Some(path) = out.advertised_link(system, "Storage") {
+        if let Some(units) = out.fetch_members(name, target, inflight, &path, 8).await {
+            let complete_links = units.iter().all(|unit| {
+                unit["Drives"]
+                    .as_array()
+                    .is_some_and(|drives| refs(unit, "Drives", 17).len() == drives.len())
+            });
+            let drive_paths: Vec<String> = units
+                .iter()
+                .flat_map(|unit| refs(unit, "Drives", 17))
+                .collect();
+            if complete_links && drive_paths.len() <= 16 {
+                let mut drives = Vec::with_capacity(drive_paths.len());
+                for path in &drive_paths {
+                    if let Some(drive) = out.fetch(name, target, inflight, path).await {
+                        metrics::drive(&mut out.samples, &drive);
+                        drives.push(drive);
+                    }
+                }
+                if drives.len() == drive_paths.len() {
+                    metrics::nvme_count(&mut out.samples, &drives);
+                }
+            } else {
+                out.errors = out.errors.saturating_add(1);
+            }
+        }
+    }
+    if let Some(path) = out.advertised_link(system, "EthernetInterfaces") {
+        if let Some(items) = out.fetch_members(name, target, inflight, &path, 16).await {
+            metrics::nics(
+                &mut out.samples,
+                &serde_json::json!({"Members": items}),
+                "onboard",
+            );
+        }
+    }
+    if let Some(manager) = out
+        .fetch(name, target, inflight, "/redfish/v1/Managers/Self")
+        .await
+    {
+        metrics::manager(&mut out.samples, &manager);
+        if let Some(path) = out.advertised_link(&manager, "EthernetInterfaces") {
+            if let Some(items) = out.fetch_members(name, target, inflight, &path, 8).await {
+                metrics::nics(
+                    &mut out.samples,
+                    &serde_json::json!({"Members": items}),
+                    "bmc",
+                );
+            }
+        }
+    }
+    if let Some(chassis) = out
+        .fetch(name, target, inflight, "/redfish/v1/Chassis/Self")
+        .await
+    {
+        metrics::chassis(&mut out.samples, &chassis);
+        if let Some(path) = out.advertised_link(&chassis, "Thermal") {
+            if let Some(value) = out.fetch(name, target, inflight, &path).await {
+                metrics::thermal(&mut out.samples, &value);
+            }
+        }
+        if let Some(path) = out.advertised_link(&chassis, "Power") {
+            if let Some(value) = out.fetch(name, target, inflight, &path).await {
+                metrics::power(&mut out.samples, &value);
+            }
+        }
+        if let Some(path) = out.advertised_link(&chassis, "Sensors") {
+            if let Some(items) = out.fetch_members(name, target, inflight, &path, 64).await {
+                for sensor in items {
+                    metrics::sensor(&mut out.samples, &sensor);
+                }
+            }
+        }
+    }
 }
 
 pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Collection {
@@ -267,6 +472,8 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
             up: forbidden,
             blocked: forbidden,
             errors: 1,
+            requests: 0,
+            budget_exhausted: false,
         };
     }
     let mut out = Collection {
@@ -274,10 +481,12 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
         up: false,
         blocked: false,
         errors: 0,
+        requests: 1,
+        budget_exhausted: false,
     };
     let probe = tokio::time::timeout(
         Duration::from_secs(10),
-        target.get("/redfish/v1/Systems/System_0", inflight),
+        target.get(target.profile.system_path(), inflight),
     )
     .await;
     let system = match probe {
@@ -295,7 +504,6 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
             return out;
         }
         Ok(Err(FetchError::Http(_))) => {
-            out.up = true;
             out.errors = 1;
             return out;
         }
@@ -306,7 +514,18 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
     };
     target.clear_circuit().await;
     out.up = true;
+    metrics::target_info(
+        &mut out.samples,
+        target.profile.id(),
+        target.profile.model(),
+        target.profile.device_type(),
+    );
     metrics::system(&mut out.samples, &system);
+
+    if target.profile != Profile::AsrockrackB3008u16x {
+        collect_cpu(name, target, inflight, &mut out, &system).await;
+        return out;
+    }
 
     // One request at a time per BMC. Do not parallelize these: AMI returns 403
     // and may block the caller's IP when the management controller is crowded.
@@ -492,7 +711,8 @@ mod tests {
                 address: address.into(),
                 username: "a".into(),
                 password: "b".into(),
-                insecure_tls: true
+                insecure_tls: true,
+                profile: Profile::AsrockrackB3008u16x
             })
             .is_err());
         }
@@ -504,6 +724,71 @@ mod tests {
         ] {
             assert!(!safe_path(path));
         }
+    }
+
+    #[test]
+    fn profiles_are_explicit_and_unknown_models_are_rejected() {
+        for (id, expected) in [
+            ("asrockrack_b300_8u16x", Profile::AsrockrackB3008u16x),
+            ("tyan_b8037", Profile::TyanB8037),
+            ("asrockrack_1u10e", Profile::Asrockrack1u10e),
+        ] {
+            let config: TargetConfig = serde_json::from_value(json!({
+                "address":"10.0.0.1", "username":"test", "password":"secret", "profile":id
+            }))
+            .unwrap();
+            assert_eq!(config.profile, expected);
+        }
+        assert!(serde_json::from_value::<TargetConfig>(json!({
+            "address":"10.0.0.1", "username":"test", "password":"secret", "profile":"unknown"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn unsafe_advertised_link_marks_scrape_incomplete() {
+        let mut result = Collection::failed();
+        assert!(result
+            .advertised_link(
+                &json!({"Memory":{"@odata.id":"//evil.example/Memory"}}),
+                "Memory"
+            )
+            .is_none());
+        assert_eq!(result.errors, 2);
+    }
+
+    #[tokio::test]
+    async fn wrong_profile_does_not_claim_redfish_up() {
+        let app = Router::new().fallback(get(|| async { StatusCode::NOT_FOUND }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = Target::mock_profile(&format!("http://{addr}/"), Profile::TyanB8037);
+        let result = collect("CPU-01", &target, &Semaphore::new(4)).await;
+        assert!(!result.up);
+        assert_eq!(result.errors, 1);
+    }
+
+    #[tokio::test]
+    async fn paginated_cpu_memory_is_incomplete_not_zero_dimms() {
+        let app = Router::new().fallback(get(|uri: Uri| async move {
+            Json(match uri.path() {
+                "/redfish/v1/Systems/Self" => json!({"PowerState":"On","Memory":{"@odata.id":"/redfish/v1/Systems/Self/Memory"}}),
+                "/redfish/v1/Systems/Self/Memory" => json!({"Members":[{"@odata.id":"/redfish/v1/Systems/Self/Memory/DIMM0"}],"Members@odata.nextLink":"/redfish/v1/Systems/Self/Memory?page=2"}),
+                _ => json!({}),
+            })
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = Target::mock_profile(&format!("http://{addr}/"), Profile::TyanB8037);
+        let output = metrics::render(
+            "TYAN-01",
+            collect("TYAN-01", &target, &Semaphore::new(4)).await,
+            0.1,
+        );
+        assert!(output.contains("redfish_scrape_complete{target=\"TYAN-01\"} 0"));
+        assert!(!output.contains("redfish_dimm_count"));
     }
 
     #[tokio::test]
@@ -571,5 +856,57 @@ mod tests {
             output.contains("redfish_gpu_temperature_celsius{target=\"B300-01\",gpu=\"GPU_0\"} 51")
         );
         assert!(!output.contains("75"));
+    }
+
+    #[tokio::test]
+    async fn cpu_profiles_follow_self_links_without_expand_or_hgx_requests() {
+        for (profile, expected_model, has_sensors) in [
+            (Profile::TyanB8037, "B8037T73X4-200PE4HR-L", false),
+            (Profile::Asrockrack1u10e, "1U10E-ICX2", true),
+        ] {
+            let paths = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen = paths.clone();
+            let app = Router::new().fallback(get(move |uri: Uri| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().expect("paths").push(uri.to_string());
+                    let value = match uri.path() {
+                        "/redfish/v1/Systems/Self" => json!({"Model":expected_model,"PowerState":"On","Status":{"Health":"OK"},"Processors":{"@odata.id":"/redfish/v1/Systems/Self/Processors"},"Memory":{"@odata.id":"/redfish/v1/Systems/Self/Memory"},"Storage":{"@odata.id":"/redfish/v1/Systems/Self/Storage"}}),
+                        "/redfish/v1/Systems/Self/Processors" => json!({"Members":[{"@odata.id":"/redfish/v1/Systems/Self/Processors/CPU0"}]}),
+                        "/redfish/v1/Systems/Self/Processors/CPU0" => json!({"ProcessorType":"CPU","Socket":"CPU0","Status":{"Health":"OK"}}),
+                        "/redfish/v1/Systems/Self/Memory" => json!({"Members":[{"@odata.id":"/redfish/v1/Systems/Self/Memory/DIMM0"}]}),
+                        "/redfish/v1/Systems/Self/Memory/DIMM0" => json!({"Name":"DIMM0","CapacityMiB":32768,"Status":{"Health":"OK"}}),
+                        "/redfish/v1/Systems/Self/Storage" => json!({"Members":[]}),
+                        "/redfish/v1/Managers/Self" => json!({"FirmwareVersion":"2.05.0","Model":"AMI"}),
+                        "/redfish/v1/Chassis/Self" => if has_sensors {json!({"Status":{"Health":"OK"},"Sensors":{"@odata.id":"/redfish/v1/Chassis/Self/Sensors"},"Power":{"@odata.id":"/redfish/v1/Chassis/Self/Power"},"Thermal":{"@odata.id":"/redfish/v1/Chassis/Self/Thermal"}})} else {json!({"Status":{"Health":"OK"}})},
+                        "/redfish/v1/Chassis/Self/Power" => json!({"PowerControl":[{"PowerConsumedWatts":420}],"PowerSupplies":[{"Name":"PSU1","Status":{"Health":"OK"},"PowerOutputWatts":225}]}),
+                        "/redfish/v1/Chassis/Self/Thermal" => json!({"Fans":[{"Name":"FAN1","Reading":4400,"ReadingUnits":"RPM","Status":{"Health":"OK"}}],"Temperatures":[{"Name":"Inlet","ReadingCelsius":28,"PhysicalContext":"Intake"}]}),
+                        "/redfish/v1/Chassis/Self/Sensors" => json!({"Members":[{"@odata.id":"/redfish/v1/Chassis/Self/Sensors/1"}]}),
+                        "/redfish/v1/Chassis/Self/Sensors/1" => json!({"Name":"CPU Temp","ReadingType":"Temperature","ReadingUnits":"Cel","Reading":46,"Status":{"Health":"OK"}}),
+                        _ => json!({"Members":[]}),
+                    };
+                    Json(value)
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let target = Target::mock_profile(&format!("http://{addr}/"), profile);
+            let result = collect("CPU-01", &target, &Semaphore::new(4)).await;
+            let output = metrics::render("CPU-01", result, 0.1);
+            assert!(output.contains("redfish_cpu_count{target=\"CPU-01\"} 1"));
+            assert!(output.contains("redfish_memory_total_bytes{target=\"CPU-01\"} 34359738368"));
+            assert!(output.contains(&format!("model=\"{expected_model}\"")));
+            assert_eq!(
+                output.contains("redfish_sensor_temperature_celsius"),
+                has_sensors
+            );
+            assert_eq!(output.contains("redfish_chassis_power_watts"), has_sensors);
+            assert_eq!(output.contains("redfish_fan_rpm"), has_sensors);
+            let paths = paths.lock().expect("paths");
+            assert!(paths
+                .iter()
+                .all(|p| !p.contains("$expand") && !p.contains("HGX")));
+        }
     }
 }

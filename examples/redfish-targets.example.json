@@ -2,6 +2,21 @@
   "targets": {
     "B300-01": {
       "address": "172.16.40.1",
+      "profile": "asrockrack_b300_8u16x",
+      "username": "REPLACE_IN_IDC_PRIVATE_SECRET_FILE",
+      "password": "REPLACE_IN_IDC_PRIVATE_SECRET_FILE",
+      "insecure_tls": true
+    },
+    "TYAN-01": {
+      "address": "10.0.0.33",
+      "profile": "tyan_b8037",
+      "username": "REPLACE_IN_IDC_PRIVATE_SECRET_FILE",
+      "password": "REPLACE_IN_IDC_PRIVATE_SECRET_FILE",
+      "insecure_tls": true
+    },
+    "ASRR-1U-01": {
+      "address": "10.0.0.37",
+      "profile": "asrockrack_1u10e",
       "username": "REPLACE_IN_IDC_PRIVATE_SECRET_FILE",
       "password": "REPLACE_IN_IDC_PRIVATE_SECRET_FILE",
       "insecure_tls": true

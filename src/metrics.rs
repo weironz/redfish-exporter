@@ -67,6 +67,30 @@ pub fn system(out: &mut Vec<Metric>, value: &Value) {
     }
 }
 
+pub fn target_info(out: &mut Vec<Metric>, profile: &str, model: &str, device_type: &str) {
+    add(
+        out,
+        "redfish_target_info",
+        vec![
+            ("profile", profile.into()),
+            ("model", model.into()),
+            ("device_type", device_type.into()),
+        ],
+        1.0,
+    );
+}
+
+pub fn chassis(out: &mut Vec<Metric>, value: &Value) {
+    if !value["Status"]["Health"].is_null() {
+        add(
+            out,
+            "redfish_chassis_health",
+            vec![],
+            health(&value["Status"]["Health"]),
+        );
+    }
+}
+
 pub fn processors(out: &mut Vec<Metric>, value: &Value) {
     let Some(members) = members(value) else {
         return;
@@ -143,6 +167,23 @@ pub fn storage(out: &mut Vec<Metric>, drive_refs: &[String]) {
             .filter(|path| path.contains("NVMe"))
             .count() as f64,
     );
+}
+
+pub fn nvme_count(out: &mut Vec<Metric>, drives: &[Value]) {
+    if drives
+        .iter()
+        .all(|drive| drive["Protocol"].as_str().is_some())
+    {
+        add(
+            out,
+            "redfish_nvme_drive_count",
+            vec![],
+            drives
+                .iter()
+                .filter(|drive| drive["Protocol"] == "NVMe")
+                .count() as f64,
+        );
+    }
 }
 
 pub fn drive(out: &mut Vec<Metric>, value: &Value) {
@@ -233,8 +274,13 @@ pub fn thermal(out: &mut Vec<Metric>, value: &Value) {
                 labels.clone(),
                 health(&fan["Status"]["Health"]),
             );
-            if let Some(rpm) = number(&fan["Reading"]) {
-                add(out, "redfish_fan_rpm", labels, rpm);
+            if fan["ReadingUnits"]
+                .as_str()
+                .is_none_or(|unit| unit == "RPM")
+            {
+                if let Some(rpm) = number(&fan["Reading"]) {
+                    add(out, "redfish_fan_rpm", labels, rpm);
+                }
             }
         }
     }
@@ -260,6 +306,72 @@ pub fn thermal(out: &mut Vec<Metric>, value: &Value) {
                 );
             }
         }
+    }
+}
+
+pub fn power(out: &mut Vec<Metric>, value: &Value) {
+    if let Some(controls) = value["PowerControl"].as_array() {
+        if controls.len() == 1 {
+            if let Some(watts) = number(&controls[0]["PowerConsumedWatts"]) {
+                add(out, "redfish_chassis_power_watts", vec![], watts);
+            }
+        }
+    }
+    if let Some(supplies) = value["PowerSupplies"].as_array() {
+        add(out, "redfish_psu_count", vec![], supplies.len() as f64);
+        for (index, supply) in supplies.iter().enumerate() {
+            let name = supply["Name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("PSU-{index}"));
+            let labels = vec![("name", name)];
+            if !supply["Status"]["Health"].is_null() {
+                add(
+                    out,
+                    "redfish_psu_health",
+                    labels.clone(),
+                    health(&supply["Status"]["Health"]),
+                );
+            }
+            if let Some(watts) = number(&supply["PowerOutputWatts"]) {
+                add(out, "redfish_psu_output_watts", labels, watts);
+            }
+        }
+    }
+}
+
+pub fn sensor(out: &mut Vec<Metric>, value: &Value) {
+    let name = string(&value["Name"]);
+    if name.is_empty() {
+        return;
+    }
+    let labels = vec![("name", name)];
+    if !value["Status"]["Health"].is_null() {
+        add(
+            out,
+            "redfish_sensor_health",
+            labels.clone(),
+            health(&value["Status"]["Health"]),
+        );
+    }
+    let Some(reading) = number(&value["Reading"]) else {
+        return;
+    };
+    match (
+        value["ReadingType"].as_str(),
+        value["ReadingUnits"].as_str(),
+    ) {
+        (Some("Temperature"), Some("Cel")) => {
+            add(out, "redfish_sensor_temperature_celsius", labels, reading);
+        }
+        (Some("Power"), Some("W")) => {
+            add(out, "redfish_sensor_power_watts", labels, reading);
+        }
+        (Some("Rotational"), Some("RPM" | "{rev}/min")) => {
+            add(out, "redfish_sensor_fan_rpm", labels, reading);
+        }
+        _ => {}
     }
 }
 
@@ -539,6 +651,53 @@ mod tests {
             &json!({"Members":[{"@odata.id":"/redfish/v1/Memory/0"}]}),
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cpu_power_and_sensor_units_are_normalized_without_guessing() {
+        let mut out = vec![];
+        power(
+            &mut out,
+            &json!({"PowerControl":[{"PowerConsumedWatts":375}],"PowerSupplies":[{"Name":"PSU1","Status":{"Health":"OK"},"PowerOutputWatts":190}]}),
+        );
+        sensor(
+            &mut out,
+            &json!({"Name":"CPU0","ReadingType":"Temperature","ReadingUnits":"Cel","Reading":51,"Status":{"Health":"OK"}}),
+        );
+        sensor(
+            &mut out,
+            &json!({"Name":"Unknown","ReadingType":"Temperature","ReadingUnits":"F","Reading":150}),
+        );
+        assert_eq!(
+            out.iter()
+                .find(|m| m.name == "redfish_chassis_power_watts")
+                .map(|m| m.value),
+            Some(375.0)
+        );
+        assert_eq!(
+            out.iter()
+                .find(|m| m.name == "redfish_sensor_temperature_celsius")
+                .map(|m| m.value),
+            Some(51.0)
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|m| m.name == "redfish_sensor_temperature_celsius")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn nvme_count_requires_known_protocol_for_every_drive() {
+        let mut out = vec![];
+        nvme_count(&mut out, &[json!({"Protocol":"NVMe"}), json!({})]);
+        assert!(out.is_empty());
+        nvme_count(
+            &mut out,
+            &[json!({"Protocol":"NVMe"}), json!({"Protocol":"SATA"})],
+        );
+        assert_eq!(out[0].value, 1.0);
     }
 
     #[test]

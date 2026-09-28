@@ -1,4 +1,4 @@
-//! Standalone, read-only B300 Redfish exporter.
+//! Standalone, read-only multi-model Redfish exporter.
 mod bmc;
 mod metrics;
 
