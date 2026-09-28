@@ -1,4 +1,4 @@
-//! Standalone, read-only B300 Redfish exporter. The Agent remains the only IDC uplink.
+//! Standalone, read-only B300 Redfish exporter.
 mod bmc;
 mod metrics;
 
@@ -101,12 +101,12 @@ async fn scrape(State(app): State<App>, Query(q): Query<HashMap<String, String>>
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let path = std::env::var("NEOSTOR_REDFISH_TARGETS_FILE")
+    let path = std::env::var("REDFISH_EXPORTER_TARGETS_FILE")
         .unwrap_or_else(|_| "/run/secrets/redfish-targets.json".into());
-    let bind: SocketAddr = std::env::var("NEOSTOR_REDFISH_BIND")
+    let bind: SocketAddr = std::env::var("REDFISH_EXPORTER_BIND")
         .unwrap_or_else(|_| "127.0.0.1:19626".into())
         .parse()
-        .context("invalid NEOSTOR_REDFISH_BIND")?;
+        .context("invalid REDFISH_EXPORTER_BIND")?;
     if !bind.ip().is_loopback() {
         bail!("exporter must bind to loopback");
     }

@@ -32,8 +32,8 @@ Environment variables:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `NEOSTOR_REDFISH_TARGETS_FILE` | `/run/secrets/redfish-targets.json` | IDC-private target and credential file |
-| `NEOSTOR_REDFISH_BIND` | `127.0.0.1:19626` | Loopback-only HTTP listener |
+| `REDFISH_EXPORTER_TARGETS_FILE` | `/run/secrets/redfish-targets.json` | IDC-private target and credential file |
+| `REDFISH_EXPORTER_BIND` | `127.0.0.1:19626` | Loopback-only HTTP listener |
 
 Endpoints: `/healthz` and `/metrics?target=B300-01`. Unknown targets return 404; overlapping scrapes of the same target return 503. The [vmagent example](examples/vmagent-scrape.example.yaml) uses a 180-second interval and 150-second timeout. It is a canary template, not an automatically loaded NeoStor configuration. Production enrollment requires NeoStor's Redfish monitoring template and dashboard/alert query adaptation.
 
