@@ -62,3 +62,18 @@ The Rust HTTP client sets a **15-second timeout for the entire GET** (`src/bmc.r
 B300-15 Device8 independently returned HTTP 200 after a 1.39-second connect and 15.45-second header wait. Response bodies arrived essentially immediately after the headers. Therefore, the **direct, demonstrated cause of the exporter errors is its 15-second request deadline being shorter than the BMC response time** for these particular detail endpoints. They are neither absent nor permanently hung. The wait is after connection establishment, so it is not explained by a failed TCP/TLS connection; the exact BMC-internal reason for the slow response remains unproven. The sampled B300-15 BMC Redfish EventLog contained no relevant NVMe/Drive timeout explanation.
 
 Merely increasing the global timeout may make one canary pass but leaves core inventory dependent on very slow endpoints and their variable latency. `SimpleStorage` expanded inventory returns all ten devices with status and capacity in about 2–3 seconds on each tested host. A future exporter change should use that fast, complete resource for baseline inventory and define a separate policy for optional Drive-only wear-life metrics, with an explicit scrape budget and failure semantics. No code or IDC deployment changed during this root-cause investigation; the legacy exporter remains stopped by user instruction.
+
+## v0.2.2 B300 inventory change and live canary
+
+The B300 collector now reads the expanded `Storage` and `SimpleStorage` collections and joins units by the advertised `Links.Storage.@odata.id` path. It emits `redfish_nvme_drive_count`, ten per-drive health, enabled-state and capacity series only when both inventories are complete and every NVMe unit maps to one drive with a serial and capacity. Missing/paginated/mismatched data marks the scrape incomplete rather than fabricating a count. The normal B300 scrape no longer calls the slow Drive detail URLs; `redfish_drive_life_left_percent` is consequently absent for B300. Other hardware profiles keep their existing Drive collection behavior. Offline tests cover successful mapping, missing/paginated inventory and the absence of Drive-detail requests.
+
+Using a locally built candidate for v0.2.2 and private temporary credentials, with the legacy Python exporter still stopped, one serial GET-only scrape per host produced:
+
+| Host | Duration | Samples | Complete | Errors | NVMe count | Per-drive health/enabled/capacity | GPU online |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| B300-10 | 53.27 s | 419 | 1 | 0 | 10 | 10 / 10 / 10 | 8/8 |
+| B300-15 | 50.17 s | 419 | 1 | 0 | 10 | 10 / 10 / 10 | 8/8 |
+
+The ten drive health samples were all `0` (`OK`) and the ten enabled samples were all `1` on both hosts, matching the tested BMC inventory. No Drive wear-life samples were emitted. This validates the baseline on these two firmware-1.40.00 BMCs only; it does not prove every fleet BMC or other firmware behaves identically. The Rust exporter was run only on a loopback-bound local test process, then stopped. Neither it nor any new configuration was deployed to IDC/NeoStor; the old exporter remains stopped until explicit user instruction.
+
+After the final duplicate-unit and capacity validation guards and the version bump, the rebuilt v0.2.2 binary was run once more against B300-10: 56.22 seconds, 419 samples, `redfish_scrape_complete=1`, zero errors, ten NVMe devices with ten health/enabled/capacity series, and eight of eight GPUs online. The B300-15 candidate result above used the same inventory path before those additional validation-only guards; it was not re-scraped with the final binary.

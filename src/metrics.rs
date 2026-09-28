@@ -1,6 +1,6 @@
 use crate::bmc::Collection;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
 pub struct Metric {
@@ -172,6 +172,125 @@ pub fn nvme_count(out: &mut Vec<Metric>, drives: &[Value]) {
                 .count() as f64,
         );
     }
+}
+
+/// B300 inventory is complete only when both expanded collections agree on every NVMe unit.
+pub fn b300_nvme_inventory(out: &mut Vec<Metric>, storage: &Value, simple: &Value) -> bool {
+    fn complete_members(value: &Value) -> Option<&Vec<Value>> {
+        let members = value["Members"].as_array()?;
+        let advertised = value["Members@odata.count"].as_u64()?;
+        (value["Members@odata.nextLink"].is_null()
+            && members.len() <= 64
+            && advertised == members.len() as u64)
+            .then_some(members)
+    }
+
+    let (Some(units), Some(simple_units)) = (complete_members(storage), complete_members(simple))
+    else {
+        return false;
+    };
+    let mut simple_by_storage = BTreeMap::new();
+    for unit in simple_units {
+        let Some(path) = unit["Links"]["Storage"]["@odata.id"].as_str() else {
+            return false;
+        };
+        if simple_by_storage.insert(path, unit).is_some() {
+            return false;
+        }
+    }
+
+    let mut staged = Vec::new();
+    let mut identities = BTreeSet::new();
+    let mut seen_units = BTreeSet::new();
+    let mut count = 0;
+    for unit in units {
+        let Some(path) = unit["@odata.id"].as_str() else {
+            return false;
+        };
+        if !seen_units.insert(path) {
+            return false;
+        }
+        let Some(controllers) = unit["StorageControllers"].as_array() else {
+            return false;
+        };
+        let nvme: Vec<_> = controllers
+            .iter()
+            .filter(|controller| {
+                controller["SupportedDeviceProtocols"]
+                    .as_array()
+                    .is_some_and(|protocols| protocols.iter().any(|p| p == "NVMe"))
+            })
+            .collect();
+        if nvme.is_empty() {
+            continue;
+        }
+        if nvme.len() != 1 {
+            return false;
+        }
+        let Some(simple_unit) = simple_by_storage.get(path) else {
+            return false;
+        };
+        let Some(devices) = simple_unit["Devices"].as_array() else {
+            return false;
+        };
+        if devices.len() != 1 {
+            return false;
+        }
+        let device = &devices[0];
+        let Some(name) = device["Name"].as_str().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        let Some(serial) = nvme[0]["SerialNumber"].as_str().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        let Some(capacity) = number(&device["CapacityBytes"]).filter(|n| n.is_finite() && *n > 0.0)
+        else {
+            return false;
+        };
+        if device["Status"]["Health"].as_str().is_none() {
+            return false;
+        }
+        let Some(state) = device["Status"]["State"].as_str() else {
+            return false;
+        };
+        if !identities.insert((name, serial)) {
+            return false;
+        }
+        let labels = vec![
+            ("name", string(&device["Name"])),
+            ("serial", string(&nvme[0]["SerialNumber"])),
+        ];
+        add(
+            &mut staged,
+            "redfish_drive_health",
+            labels.clone(),
+            health(&device["Status"]["Health"]),
+        );
+        add(
+            &mut staged,
+            "redfish_drive_enabled",
+            labels.clone(),
+            f64::from(state == "Enabled"),
+        );
+        add(
+            &mut staged,
+            "redfish_drive_capacity_bytes",
+            labels,
+            capacity,
+        );
+        count += 1;
+    }
+    if count == 0 {
+        return false;
+    }
+    add(
+        &mut staged,
+        "redfish_nvme_drive_count",
+        vec![],
+        count as f64,
+    );
+    out.extend(staged);
+    true
 }
 
 pub fn drive(out: &mut Vec<Metric>, value: &Value) {
@@ -686,6 +805,79 @@ mod tests {
             &[json!({"Protocol":"NVMe"}), json!({"Protocol":"SATA"})],
         );
         assert_eq!(out[0].value, 1.0);
+    }
+
+    #[test]
+    fn b300_nvme_inventory_uses_complete_linked_simple_storage() {
+        let storage = json!({
+            "Members@odata.count": 2,
+            "Members": [
+                {"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_0", "StorageControllers":[]},
+                {"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_A",
+                 "StorageControllers":[{"SerialNumber":"NVME-A", "SupportedDeviceProtocols":["NVMe"]}]}
+            ]
+        });
+        let simple = json!({
+            "Members@odata.count": 2,
+            "Members": [
+                {"Id":"0", "Links":{"Storage":{"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_0"}}, "Devices":[]},
+                {"Id":"A", "Links":{"Storage":{"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_A"}},
+                 "Devices":[{"Name":"PCIeDevice_01_8F_00", "Model":"Samsung NVMe",
+                             "CapacityBytes":3840755982336_u64, "Status":{"Health":"OK", "State":"Enabled"}}]}
+            ]
+        });
+        let mut out = vec![];
+        assert!(b300_nvme_inventory(&mut out, &storage, &simple));
+        assert_eq!(
+            out.iter()
+                .find(|m| m.name == "redfish_nvme_drive_count")
+                .map(|m| m.value),
+            Some(1.0)
+        );
+        let health = out
+            .iter()
+            .find(|m| m.name == "redfish_drive_health")
+            .unwrap();
+        assert_eq!(health.value, 0.0);
+        assert!(health.labels.contains(&("serial", "NVME-A".into())));
+        assert_eq!(
+            out.iter()
+                .find(|m| m.name == "redfish_drive_capacity_bytes")
+                .map(|m| m.value),
+            Some(3840755982336.0)
+        );
+        assert!(!out
+            .iter()
+            .any(|m| m.name == "redfish_drive_life_left_percent"));
+    }
+
+    #[test]
+    fn b300_nvme_inventory_rejects_missing_or_paginated_members() {
+        let storage = json!({
+            "Members@odata.count": 1,
+            "Members": [{"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_A",
+                         "StorageControllers":[{"SerialNumber":"NVME-A", "SupportedDeviceProtocols":["NVMe"]}]}]
+        });
+        let simple = json!({
+            "Members@odata.count": 1,
+            "Members": [{"Links":{"Storage":{"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_B"}},
+                         "Devices":[{"Name":"NVMe", "CapacityBytes":100, "Status":{"Health":"OK"}}]}]
+        });
+        let mut out = vec![];
+        assert!(!b300_nvme_inventory(&mut out, &storage, &simple));
+        assert!(out.is_empty());
+        let mut paginated = simple;
+        paginated["Members@odata.nextLink"] = json!("/next");
+        assert!(!b300_nvme_inventory(&mut out, &storage, &paginated));
+        assert!(out.is_empty());
+
+        let missing_capacity = json!({
+            "Members@odata.count": 1,
+            "Members": [{"Links":{"Storage":{"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_A"}},
+                         "Devices":[{"Name":"NVMe", "Status":{"Health":"OK", "State":"Enabled"}}]}]
+        });
+        assert!(!b300_nvme_inventory(&mut out, &storage, &missing_capacity));
+        assert!(out.is_empty());
     }
 
     #[test]

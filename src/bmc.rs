@@ -552,7 +552,7 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
     {
         metrics::memory(&mut out.samples, &v);
     }
-    if let Some(v) = out
+    if let Some(storage) = out
         .fetch(
             name,
             target,
@@ -561,30 +561,18 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
         )
         .await
     {
-        let mut drive_refs = Vec::new();
-        let mut complete =
-            v["Members"].as_array().is_some() && v["Members@odata.nextLink"].is_null();
-        for unit in v["Members"].as_array().into_iter().flatten() {
-            let Some(drives) = unit["Drives"].as_array() else {
-                continue;
-            };
-            let paths = refs(unit, "Drives", 33);
-            complete &= paths.len() == drives.len();
-            drive_refs.extend(paths);
-        }
-        complete &= drive_refs.len() <= 32;
-        if !complete {
-            out.errors = out.errors.saturating_add(1);
-        }
-        let mut drives = Vec::with_capacity(drive_refs.len().min(32));
-        for reference in drive_refs.iter().take(32) {
-            if let Some(drive) = out.fetch(name, target, inflight, reference).await {
-                metrics::drive(&mut out.samples, &drive);
-                drives.push(drive);
+        if let Some(simple) = out
+            .fetch(
+                name,
+                target,
+                inflight,
+                "/redfish/v1/Systems/System_0/SimpleStorage?$expand=*($levels=1)",
+            )
+            .await
+        {
+            if !metrics::b300_nvme_inventory(&mut out.samples, &storage, &simple) {
+                out.errors = out.errors.saturating_add(1);
             }
-        }
-        if complete && drives.len() == drive_refs.len() {
-            metrics::nvme_count(&mut out.samples, &drives);
         }
     }
     if let Some(v) = out
@@ -809,13 +797,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_b300_drive_details_do_not_claim_a_drive_count() {
+    async fn b300_uses_simple_storage_without_slow_drive_detail_gets() {
+        let drive_calls = Arc::new(AtomicUsize::new(0));
+        let observed = drive_calls.clone();
+        let app = Router::new().fallback(get(move |uri: Uri| {
+            let observed = observed.clone();
+            async move {
+                let value = match uri.path() {
+                    "/redfish/v1/Systems/System_0" => json!({"PowerState":"On","Status":{"Health":"OK"}}),
+                    "/redfish/v1/Systems/System_0/Storage" => json!({
+                        "Members@odata.count":1,
+                        "Members":[{"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_A",
+                            "StorageControllers":[{"SerialNumber":"NVME-A","SupportedDeviceProtocols":["NVMe"]}],
+                            "Drives":[{"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_A/Drives/NVMe_Device7_NSID1"}]}]
+                    }),
+                    "/redfish/v1/Systems/System_0/SimpleStorage" => json!({
+                        "Members@odata.count":1,
+                        "Members":[{"Links":{"Storage":{"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_A"}},
+                            "Devices":[{"Name":"PCIeDevice_01_8F_00","CapacityBytes":3840755982336_u64,
+                                        "Status":{"Health":"OK","State":"Enabled"}}]}]
+                    }),
+                    path if path.contains("/Drives/") => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    _ => json!({"Members":[]}),
+                };
+                Json(value).into_response()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = Target::mock(&format!("http://{addr}/"));
+        let result = collect("B300-10", &target, &Semaphore::new(4)).await;
+        assert_eq!(result.errors, 0);
+        assert_eq!(drive_calls.load(Ordering::SeqCst), 0);
+        let output = metrics::render("B300-10", result, 0.1);
+        assert!(output.contains("redfish_nvme_drive_count{target=\"B300-10\"} 1"));
+        assert!(output.contains("redfish_scrape_complete{target=\"B300-10\"} 1"));
+        assert!(!output.contains("redfish_drive_life_left_percent"));
+    }
+
+    #[tokio::test]
+    async fn missing_b300_simple_storage_does_not_claim_a_drive_count() {
         let app = Router::new().fallback(get(|uri: Uri| async move {
             let value = match uri.path() {
                 "/redfish/v1/Systems/System_0" => json!({"PowerState":"On","Status":{"Health":"OK"}}),
-                "/redfish/v1/Systems/System_0/Storage" => json!({"Members":[{"Drives":[{"@odata.id":"/redfish/v1/Systems/System_0/Storage/Unit/Drives/NVMe0"},{"@odata.id":"/redfish/v1/Systems/System_0/Storage/Unit/Drives/NVMe1"}]}]}),
-                "/redfish/v1/Systems/System_0/Storage/Unit/Drives/NVMe0" => json!({"Name":"NVMe0","Protocol":"NVMe","Status":{"Health":"OK"}}),
-                "/redfish/v1/Systems/System_0/Storage/Unit/Drives/NVMe1" => return StatusCode::NOT_FOUND.into_response(),
+                "/redfish/v1/Systems/System_0/Storage" => json!({"Members@odata.count":1,"Members":[{"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_A","StorageControllers":[{"SerialNumber":"NVME-A","SupportedDeviceProtocols":["NVMe"]}]}]}),
+                "/redfish/v1/Systems/System_0/SimpleStorage" => return StatusCode::NOT_FOUND.into_response(),
                 _ => json!({"Members":[]}),
             };
             Json(value).into_response()
@@ -876,6 +906,8 @@ mod tests {
                 a.fetch_sub(1, Ordering::SeqCst);
                 let v = match uri.path() {
                     "/redfish/v1/Systems/System_0" => json!({"PowerState":"On","Status":{"HealthRollup":"OK"}}),
+                    "/redfish/v1/Systems/System_0/Storage" => json!({"Members@odata.count":1,"Members":[{"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_A","StorageControllers":[{"SerialNumber":"NVME-A","SupportedDeviceProtocols":["NVMe"]}]}]}),
+                    "/redfish/v1/Systems/System_0/SimpleStorage" => json!({"Members@odata.count":1,"Members":[{"Links":{"Storage":{"@odata.id":"/redfish/v1/Systems/System_0/Storage/StorageUnit_A"}},"Devices":[{"Name":"NVMe","CapacityBytes":100,"Status":{"Health":"OK","State":"Enabled"}}]}]}),
                     "/redfish/v1/Systems/HGX_Baseboard_0/Processors" => json!({"Members":[{"@odata.id":"/redfish/v1/Systems/HGX_Baseboard_0/Processors/GPU_0"}]}),
                     "/redfish/v1/Systems/HGX_Baseboard_0/Processors/GPU_0" => json!({"Status":{"State":"Enabled"},"MemorySummary":{"TotalMemorySizeMiB":288000}}),
                     "/redfish/v1/TelemetryService/MetricReports/HGX_PlatformEnvironmentMetrics_0" => json!({"MetricValues":[{"MetricProperty":"/HGX_GPU_0_TEMP_0","MetricValue":"51"},{"MetricProperty":"/HGX_GPU_0_DRAM_0_TEMP_0","MetricValue":"75"}]}),
