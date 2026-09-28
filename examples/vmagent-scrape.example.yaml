@@ -1,0 +1,17 @@
+# Example vmagent job for a single canary only. Do not enable alongside the
+# existing Python exporter for the same BMC. This file is NOT auto-loaded.
+# The Agent's published monitoring config replaces scrape.yaml; production
+# enrollment needs a Redfish template in the config renderer first.
+- job_name: b300-redfish-canary
+  metrics_path: /metrics
+  scrape_interval: 180s
+  scrape_timeout: 150s
+  params:
+    target: [B300-01]
+  static_configs:
+    - targets: [127.0.0.1:19626]
+      labels:
+        host: B300-01
+        device_type: gpu_server
+        cluster: chonburi-b300
+  sample_limit: 20000

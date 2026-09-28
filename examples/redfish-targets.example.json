@@ -1,0 +1,10 @@
+{
+  "targets": {
+    "B300-01": {
+      "address": "172.16.40.1",
+      "username": "REPLACE_IN_IDC_PRIVATE_SECRET_FILE",
+      "password": "REPLACE_IN_IDC_PRIVATE_SECRET_FILE",
+      "insecure_tls": true
+    }
+  }
+}

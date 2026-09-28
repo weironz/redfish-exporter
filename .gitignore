@@ -1,0 +1,7 @@
+/target/
+/.env
+/.env.*
+/secrets/
+*.local.*
+.DS_Store
+Thumbs.db

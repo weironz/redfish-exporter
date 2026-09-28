@@ -1,0 +1,6 @@
+.git/
+target/
+secrets/
+.env
+.env.*
+*.local.*
