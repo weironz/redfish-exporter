@@ -157,18 +157,6 @@ pub fn memory(out: &mut Vec<Metric>, value: &Value) {
     }
 }
 
-pub fn storage(out: &mut Vec<Metric>, drive_refs: &[String]) {
-    add(
-        out,
-        "redfish_nvme_drive_count",
-        vec![],
-        drive_refs
-            .iter()
-            .filter(|path| path.contains("NVMe"))
-            .count() as f64,
-    );
-}
-
 pub fn nvme_count(out: &mut Vec<Metric>, drives: &[Value]) {
     if drives
         .iter()

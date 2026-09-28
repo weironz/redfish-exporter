@@ -19,7 +19,7 @@ No new IDC inbound firewall port is required. `node_exporter` and DCGM are optio
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-docker build -t redfish-exporter:v0.2.0 .
+docker build -t redfish-exporter:v0.2.1 .
 ```
 
 The container image is built locally; this repository does not automatically publish or deploy it. NeoStor's optional Compose `redfish` profile can reference a version-pinned image from an approved registry or a locally loaded image.
@@ -50,9 +50,11 @@ Endpoints: `/healthz` and `/metrics?target=B300-01`. Unknown targets return 404;
 ## Safety and metric semantics
 
 - Reads use profile-selected paths and validated same-origin Redfish links, GET only, one request at a time per BMC, at most 96 requests per scrape. CPU member collections are bounded and deliberately do not use `$expand`; an oversized/paginated collection is reported incomplete rather than counted as zero. A 403 triggers 180–1800 seconds of quiet backoff; timeouts also back off. Never run this exporter and the legacy Python exporter against the same BMC concurrently. First exclude one canary BMC from the old collector, then validate and expand gradually.
-- `redfish_gpu_count` is the number of enumerated slots. Use `redfish_gpu_online_count` and per-GPU `redfish_gpu_online` for card presence. Missing component data is omitted rather than reported as zero or replayed as a fresh sample. `redfish_scrape_complete` and `redfish_scrape_errors` describe partial failures.
+- `redfish_gpu_count` is the number of enumerated slots. Use `redfish_gpu_online_count` and per-GPU `redfish_gpu_online` for card presence. `redfish_nvme_drive_count` is emitted only when every advertised drive detail was read and its protocol identified; a partial drive scan must not claim a complete inventory count. Missing component data is omitted rather than reported as zero or replayed as a fresh sample. `redfish_scrape_complete` and `redfish_scrape_errors` describe partial failures.
 - `redfish_target_info{profile,model,device_type}` carries bounded configured model metadata for dashboard grouping. New CPU metrics include `redfish_chassis_health`, `redfish_chassis_power_watts`, `redfish_psu_*`, and `redfish_sensor_*`; numeric sensor readings are exported only when their units are known. `redfish_up=0` means the profile's system probe did not succeed, including HTTP 404 from a wrong profile.
 - Hardware metrics include system power/health, CPU, DIMM, NVMe, NIC, fan, physical temperature, PCIe, HGX board/power, GPU temperature/power and ECC/row-remap counters. The exporter filters AMI `TEMP_CPU`, `FSC`, `Tlimit`, and `Tcontrol` pseudo-temperature fields.
 - Redfish does not reliably expose GPU utilization, processes, Xid, NVLink/NVSwitch bandwidth, or IB fabric congestion. These must remain unavailable unless an authorized additional source supplies them; absence does not mean healthy or zero.
 
 Offline tests use a mock BMC only. Live canary collection and IDC/production deployment require separate authorization and coordination with the existing collector.
+
+The first authorized one-host-per-model canary results are recorded in [the validation report](docs/live-validation-2026-09-28.md). This repository has not deployed the new exporter to IDC or NeoStor production.

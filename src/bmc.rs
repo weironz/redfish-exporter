@@ -313,6 +313,7 @@ impl Collection {
             Err(error) => {
                 tracing::warn!(
                     target = name,
+                    path,
                     reason = error.reason(),
                     "Redfish read failed"
                 );
@@ -561,14 +562,29 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
         .await
     {
         let mut drive_refs = Vec::new();
+        let mut complete =
+            v["Members"].as_array().is_some() && v["Members@odata.nextLink"].is_null();
         for unit in v["Members"].as_array().into_iter().flatten() {
-            drive_refs.extend(refs(unit, "Drives", 32));
+            let Some(drives) = unit["Drives"].as_array() else {
+                continue;
+            };
+            let paths = refs(unit, "Drives", 33);
+            complete &= paths.len() == drives.len();
+            drive_refs.extend(paths);
         }
-        metrics::storage(&mut out.samples, &drive_refs);
+        complete &= drive_refs.len() <= 32;
+        if !complete {
+            out.errors = out.errors.saturating_add(1);
+        }
+        let mut drives = Vec::with_capacity(drive_refs.len().min(32));
         for reference in drive_refs.iter().take(32) {
             if let Some(drive) = out.fetch(name, target, inflight, reference).await {
                 metrics::drive(&mut out.samples, &drive);
+                drives.push(drive);
             }
+        }
+        if complete && drives.len() == drive_refs.len() {
+            metrics::nvme_count(&mut out.samples, &drives);
         }
     }
     if let Some(v) = out
@@ -689,6 +705,7 @@ mod tests {
     use super::*;
     use axum::{
         http::{StatusCode, Uri},
+        response::IntoResponse,
         routing::get,
         Json, Router,
     };
@@ -789,6 +806,31 @@ mod tests {
         );
         assert!(output.contains("redfish_scrape_complete{target=\"TYAN-01\"} 0"));
         assert!(!output.contains("redfish_dimm_count"));
+    }
+
+    #[tokio::test]
+    async fn failed_b300_drive_details_do_not_claim_a_drive_count() {
+        let app = Router::new().fallback(get(|uri: Uri| async move {
+            let value = match uri.path() {
+                "/redfish/v1/Systems/System_0" => json!({"PowerState":"On","Status":{"Health":"OK"}}),
+                "/redfish/v1/Systems/System_0/Storage" => json!({"Members":[{"Drives":[{"@odata.id":"/redfish/v1/Systems/System_0/Storage/Unit/Drives/NVMe0"},{"@odata.id":"/redfish/v1/Systems/System_0/Storage/Unit/Drives/NVMe1"}]}]}),
+                "/redfish/v1/Systems/System_0/Storage/Unit/Drives/NVMe0" => json!({"Name":"NVMe0","Protocol":"NVMe","Status":{"Health":"OK"}}),
+                "/redfish/v1/Systems/System_0/Storage/Unit/Drives/NVMe1" => return StatusCode::NOT_FOUND.into_response(),
+                _ => json!({"Members":[]}),
+            };
+            Json(value).into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = Target::mock(&format!("http://{addr}/"));
+        let output = metrics::render(
+            "B300-10",
+            collect("B300-10", &target, &Semaphore::new(4)).await,
+            0.1,
+        );
+        assert!(output.contains("redfish_scrape_complete{target=\"B300-10\"} 0"));
+        assert!(!output.contains("redfish_nvme_drive_count"));
     }
 
     #[tokio::test]
