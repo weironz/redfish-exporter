@@ -1,0 +1,167 @@
+[
+  {
+    "schema": "redfish.capabilities.v1",
+    "profile": "asrockrack_b300_8u16x",
+    "model": "8U16X-GNR2",
+    "device_type": "gpu_server",
+    "read_only": true,
+    "capabilities": [
+      {
+        "id": "health",
+        "state": "conditional",
+        "reason": "BMC system status required"
+      },
+      {
+        "id": "compute_inventory",
+        "state": "conditional",
+        "reason": "advertised processors and memory"
+      },
+      {
+        "id": "drives",
+        "state": "conditional",
+        "reason": "complete storage inventory required"
+      },
+      {
+        "id": "drive_wear",
+        "state": "unsupported",
+        "reason": "slow Drive details excluded from baseline"
+      },
+      {
+        "id": "environment",
+        "state": "conditional",
+        "reason": "advertised resources and known units required"
+      },
+      {
+        "id": "gpu",
+        "state": "conditional",
+        "reason": "HGX inventory/telemetry must be readable"
+      },
+      {
+        "id": "nvlink",
+        "state": "unsupported",
+        "reason": "not provided by current Redfish collector"
+      },
+      {
+        "id": "os_utilization",
+        "state": "unsupported",
+        "reason": "out of band only; no tenant OS access"
+      }
+    ],
+    "value_semantics": {
+      "missing": "unknown, not zero",
+      "zero": "valid only when emitted",
+      "timeout": "scrape error, not unsupported",
+      "freshness": "per scrape timestamp"
+    }
+  },
+  {
+    "schema": "redfish.capabilities.v1",
+    "profile": "tyan_b8037",
+    "model": "B8037T73X4-200PE4HR-L",
+    "device_type": "cpu_server",
+    "read_only": true,
+    "capabilities": [
+      {
+        "id": "health",
+        "state": "conditional",
+        "reason": "BMC system status required"
+      },
+      {
+        "id": "compute_inventory",
+        "state": "conditional",
+        "reason": "advertised processors and memory"
+      },
+      {
+        "id": "drives",
+        "state": "conditional",
+        "reason": "complete storage inventory required"
+      },
+      {
+        "id": "drive_wear",
+        "state": "conditional",
+        "reason": "only if BMC exposes life remaining"
+      },
+      {
+        "id": "environment",
+        "state": "conditional",
+        "reason": "advertised resources and known units required"
+      },
+      {
+        "id": "gpu",
+        "state": "unsupported",
+        "reason": "CPU profile has no GPU collector"
+      },
+      {
+        "id": "nvlink",
+        "state": "unsupported",
+        "reason": "not provided by current Redfish collector"
+      },
+      {
+        "id": "os_utilization",
+        "state": "unsupported",
+        "reason": "out of band only; no tenant OS access"
+      }
+    ],
+    "value_semantics": {
+      "missing": "unknown, not zero",
+      "zero": "valid only when emitted",
+      "timeout": "scrape error, not unsupported",
+      "freshness": "per scrape timestamp"
+    }
+  },
+  {
+    "schema": "redfish.capabilities.v1",
+    "profile": "asrockrack_1u10e",
+    "model": "1U10E-ICX2",
+    "device_type": "cpu_server",
+    "read_only": true,
+    "capabilities": [
+      {
+        "id": "health",
+        "state": "conditional",
+        "reason": "BMC system status required"
+      },
+      {
+        "id": "compute_inventory",
+        "state": "conditional",
+        "reason": "advertised processors and memory"
+      },
+      {
+        "id": "drives",
+        "state": "conditional",
+        "reason": "complete storage inventory required"
+      },
+      {
+        "id": "drive_wear",
+        "state": "conditional",
+        "reason": "only if BMC exposes life remaining"
+      },
+      {
+        "id": "environment",
+        "state": "conditional",
+        "reason": "advertised resources and known units required"
+      },
+      {
+        "id": "gpu",
+        "state": "unsupported",
+        "reason": "CPU profile has no GPU collector"
+      },
+      {
+        "id": "nvlink",
+        "state": "unsupported",
+        "reason": "not provided by current Redfish collector"
+      },
+      {
+        "id": "os_utilization",
+        "state": "unsupported",
+        "reason": "out of band only; no tenant OS access"
+      }
+    ],
+    "value_semantics": {
+      "missing": "unknown, not zero",
+      "zero": "valid only when emitted",
+      "timeout": "scrape error, not unsupported",
+      "freshness": "per scrape timestamp"
+    }
+  }
+]

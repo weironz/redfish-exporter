@@ -19,6 +19,23 @@ pub fn profile(id: &str, model: &str, kind: &str) -> Value {
 mod tests {
     use super::*;
     #[test]
+    fn shared_provider_fixture_is_exactly_what_the_exporter_emits() {
+        let fixtures: Vec<Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/provider-contract-v1.json"))
+                .unwrap();
+        assert_eq!(fixtures.len(), 3);
+        for fixture in fixtures {
+            assert_eq!(
+                profile(
+                    fixture["profile"].as_str().unwrap(),
+                    fixture["model"].as_str().unwrap(),
+                    fixture["device_type"].as_str().unwrap()
+                ),
+                fixture
+            );
+        }
+    }
+    #[test]
     fn three_profiles_distinguish_conditional_and_unsupported_without_fake_values() {
         for (id, model, kind) in [
             ("asrockrack_b300_8u16x", "8U16X-GNR2", "gpu_server"),
