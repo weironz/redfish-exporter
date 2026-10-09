@@ -111,6 +111,13 @@ impl FetchError {
 }
 
 impl Target {
+    pub fn capabilities(&self) -> Value {
+        crate::capabilities::profile(
+            self.profile.id(),
+            self.profile.model(),
+            self.profile.device_type(),
+        )
+    }
     pub fn new(config: TargetConfig) -> Result<Self> {
         let address: Ipv4Addr = config.address.parse()?;
         if !address.is_private()

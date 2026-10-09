@@ -11,7 +11,7 @@ BMC --HTTPS/Redfish--> redfish-exporter <--HTTP/loopback-- vmagent
 vmagent --remote write/loopback--> NeoStor Agent --existing uplink--> center
 ```
 
-No new IDC inbound firewall port is required. `node_exporter` and DCGM are optional enhancements where the server renter grants OS access; they are not prerequisites for this exporter.
+No new IDC inbound firewall port is required. This exporter never requires tenant OS access. NeoStor currently disables node/DCGM in-band monitoring support; this project does not enable it.
 
 ## Build and test
 
@@ -46,6 +46,8 @@ Environment variables:
 | `REDFISH_EXPORTER_BIND` | `127.0.0.1:19626` | Loopback-only HTTP listener |
 
 Endpoints: `/healthz` and `/metrics?target=B300-01`. Unknown targets return 404; overlapping scrapes of the same target return 503. The [vmagent example](examples/vmagent-scrape.example.yaml) uses a 180-second interval and 150-second timeout. It is a canary template, not an automatically loaded NeoStor configuration. Production enrollment requires NeoStor's Redfish monitoring template and dashboard/alert query adaptation.
+
+The new development endpoint `/capabilities?target=B300-01` returns the versioned `redfish.capabilities.v1` metadata contract without reading the BMC. It exposes only the configured profile/model, read-only capability IDs, `conditional`/`unsupported` states, and value semantics; it never returns target addresses, credential references, passwords, or measured values. `conditional` means implemented but dependent on advertised BMC resources, not healthy or successfully scraped. Timeout/error is separate from unsupported, and missing values are never synthesized as zero. Unknown aliases return 404. NeoStor Agent consumes this loopback-only endpoint after applying an identity-bound configuration and reports safe typed metadata under `monitoring.capabilities.v1`; the center validates the exact Agent, asset, profile and latest acknowledged revision. Existing published v0.2.2 images do **not** contain this endpoint until a separately approved image release.
 
 ## Safety and metric semantics
 

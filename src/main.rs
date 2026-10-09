@@ -1,5 +1,6 @@
 //! Standalone, read-only multi-model Redfish exporter.
 mod bmc;
+mod capabilities;
 mod metrics;
 
 use anyhow::{bail, Context, Result};
@@ -61,6 +62,12 @@ fn load_targets(path: &Path) -> Result<HashMap<String, Arc<bmc::Target>>> {
 async fn healthz() -> &'static str {
     "ok\n"
 }
+async fn capability(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Response {
+    match q.get("target").and_then(|alias| app.targets.get(alias)) {
+        Some(target) => axum::Json(target.capabilities()).into_response(),
+        None => (StatusCode::NOT_FOUND, "configured target alias required").into_response(),
+    }
+}
 
 async fn scrape(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Response {
     let Some(name) = q.get("target") else {
@@ -120,6 +127,7 @@ async fn main() -> Result<()> {
         listener,
         Router::new()
             .route("/healthz", get(healthz))
+            .route("/capabilities", get(capability))
             .route("/metrics", get(scrape))
             .with_state(app),
     )
