@@ -61,6 +61,9 @@ impl Profile {
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
     address: String,
+    /// IDC-local reference, not a password. Required only by identity-v2 binding checks.
+    #[serde(default)]
+    credential_ref: Option<String>,
     username: String,
     password: String,
     #[serde(default)]
@@ -80,6 +83,8 @@ struct Circuit {
 
 pub struct Target {
     base: reqwest::Url,
+    address: String,
+    credential_ref: Option<String>,
     username: String,
     password: String,
     client: reqwest::Client,
@@ -111,6 +116,12 @@ impl FetchError {
 }
 
 impl Target {
+    pub fn binding_matches(&self, address: &str, profile: &str, credential_ref: &str) -> bool {
+        self.address == address
+            && self.profile.id() == profile
+            && self.credential_ref.as_deref() == Some(credential_ref)
+            && !credential_ref.is_empty()
+    }
     pub fn capabilities(&self) -> Value {
         crate::capabilities::profile(
             self.profile.id(),
@@ -142,6 +153,8 @@ impl Target {
             .build()?;
         Ok(Self {
             base,
+            address: config.address,
+            credential_ref: config.credential_ref,
             username: config.username,
             password: config.password,
             client,
@@ -161,6 +174,7 @@ impl Target {
         Self::with_base(
             TargetConfig {
                 address: "10.0.0.1".into(),
+                credential_ref: None,
                 username: "test".into(),
                 password: "secret".into(),
                 insecure_tls: false,
@@ -721,6 +735,7 @@ mod tests {
         ] {
             assert!(Target::new(TargetConfig {
                 address: address.into(),
+                credential_ref: None,
                 username: "a".into(),
                 password: "b".into(),
                 insecure_tls: true,

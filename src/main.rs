@@ -8,8 +8,8 @@ use axum::{
     extract::{Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
 use serde::Deserialize;
 use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc, time::Duration};
@@ -61,6 +61,20 @@ fn load_targets(path: &Path) -> Result<HashMap<String, Arc<bmc::Target>>> {
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BindingCheck {
+    target: String,
+    address: String,
+    profile: String,
+    credential_ref: String,
+}
+/// Local config comparison only; deliberately never opens a BMC session.
+async fn binding_check(State(app): State<App>, Json(check): Json<BindingCheck>) -> Json<bool> {
+    Json(app.targets.get(&check.target).is_some_and(|target| {
+        target.binding_matches(&check.address, &check.profile, &check.credential_ref)
+    }))
 }
 async fn capability(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Response {
     match q.get("target").and_then(|alias| app.targets.get(alias)) {
@@ -128,9 +142,49 @@ async fn main() -> Result<()> {
         Router::new()
             .route("/healthz", get(healthz))
             .route("/capabilities", get(capability))
+            .route("/binding-check", post(binding_check))
             .route("/metrics", get(scrape))
             .with_state(app),
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn binding_check_is_exact_fail_closed_and_never_probes_bmc() {
+        let target = bmc::Target::new(
+            serde_json::from_value(serde_json::json!({
+                "address":"10.0.0.1","username":"fixture","password":"fixture-only",
+                "credential_ref":"rack-a","profile":"tyan_b8037"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let app = App {
+            targets: Arc::new(HashMap::from([("cpu-a".into(), Arc::new(target))])),
+            inflight: Arc::new(Semaphore::new(1)),
+        };
+        let check = || BindingCheck {
+            target: "cpu-a".into(),
+            address: "10.0.0.1".into(),
+            profile: "tyan_b8037".into(),
+            credential_ref: "rack-a".into(),
+        };
+        assert!(binding_check(State(app.clone()), Json(check())).await.0);
+        let mut wrong = check();
+        wrong.address = "10.0.0.2".into();
+        assert!(!binding_check(State(app.clone()), Json(wrong)).await.0);
+        let mut wrong = check();
+        wrong.credential_ref = "rack-b".into();
+        assert!(!binding_check(State(app.clone()), Json(wrong)).await.0);
+        let mut wrong = check();
+        wrong.profile = "asrockrack_1u10e".into();
+        assert!(!binding_check(State(app.clone()), Json(wrong)).await.0);
+        let mut wrong = check();
+        wrong.target = "cpu-b".into();
+        assert!(!binding_check(State(app), Json(wrong)).await.0);
+    }
 }
