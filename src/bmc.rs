@@ -71,6 +71,9 @@ pub struct TargetConfig {
     /// Legacy files without a profile remain B300-only. Other models must opt in.
     #[serde(default)]
     profile: Profile,
+    /// Explicit IDC opt-in. Never enabled by a central scrape query alone.
+    #[serde(default)]
+    slow_drive_wear: bool,
 }
 
 #[derive(Default)]
@@ -89,8 +92,13 @@ pub struct Target {
     password: String,
     client: reqwest::Client,
     pub scrape_lock: Mutex<()>,
+    pub fast_lock: Mutex<()>,
     circuit: Mutex<Circuit>,
     profile: Profile,
+    pub slow_drive_wear: bool,
+    pub slow_lock: Mutex<()>,
+    pub slow_snapshot: Mutex<Option<String>>,
+    pub slow_due: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug)]
@@ -123,11 +131,21 @@ impl Target {
             && !credential_ref.is_empty()
     }
     pub fn capabilities(&self) -> Value {
-        crate::capabilities::profile(
+        let mut value = crate::capabilities::profile(
             self.profile.id(),
             self.profile.model(),
             self.profile.device_type(),
-        )
+        );
+        if self.slow_drive_wear {
+            if let Some(capability) = value["capabilities"]
+                .as_array_mut()
+                .and_then(|items| items.iter_mut().find(|c| c["id"] == "drive_wear"))
+            {
+                capability["state"] = serde_json::json!("conditional");
+                capability["reason"] = serde_json::json!("IDC opt-in slow snapshot; separate source timestamp, 1800s cadence and 90s budget");
+            }
+        }
+        value
     }
     pub fn new(config: TargetConfig) -> Result<Self> {
         let address: Ipv4Addr = config.address.parse()?;
@@ -145,6 +163,9 @@ impl Target {
     }
 
     fn with_base(config: TargetConfig, base: reqwest::Url) -> Result<Self> {
+        if config.slow_drive_wear && config.profile != Profile::AsrockrackB3008u16x {
+            bail!("slow drive wear is currently supported only by B300 profile");
+        }
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(config.insecure_tls)
             .redirect(reqwest::redirect::Policy::none())
@@ -159,8 +180,13 @@ impl Target {
             password: config.password,
             client,
             scrape_lock: Mutex::new(()),
+            fast_lock: Mutex::new(()),
             circuit: Mutex::new(Circuit::default()),
             profile: config.profile,
+            slow_drive_wear: config.slow_drive_wear,
+            slow_lock: Mutex::new(()),
+            slow_snapshot: Mutex::new(None),
+            slow_due: Mutex::new(None),
         })
     }
 
@@ -179,6 +205,7 @@ impl Target {
                 password: "secret".into(),
                 insecure_tls: false,
                 profile,
+                slow_drive_wear: false,
             },
             reqwest::Url::parse(base).expect("mock URL"),
         )
@@ -186,6 +213,15 @@ impl Target {
     }
 
     async fn get(&self, path: &str, inflight: &Semaphore) -> Result<Value, FetchError> {
+        self.get_with_timeout(path, inflight, Duration::from_secs(15))
+            .await
+    }
+    async fn get_with_timeout(
+        &self,
+        path: &str,
+        inflight: &Semaphore,
+        timeout: Duration,
+    ) -> Result<Value, FetchError> {
         if !safe_path(path) {
             return Err(FetchError::Transport);
         }
@@ -197,6 +233,7 @@ impl Target {
         let response = self
             .client
             .get(url)
+            .timeout(timeout)
             .basic_auth(&self.username, Some(&self.password))
             .header(reqwest::header::CONNECTION, "close")
             .send()
@@ -290,6 +327,107 @@ fn refs(value: &Value, key: &str, max: usize) -> Vec<String> {
         .collect()
 }
 
+fn path_group(path: &str) -> &'static str {
+    if path.contains("MetricReports/") {
+        return "gpu";
+    }
+    if path.contains("Storage") || path.contains("Drives") {
+        "drives"
+    } else if path.contains("Ethernet") || path.contains("PCIe") {
+        "network"
+    } else if path.contains("Thermal")
+        || path.contains("Power")
+        || path.contains("Sensors")
+        || path.contains("EnvironmentMetrics")
+    {
+        "power"
+    } else if path.contains("HGX") {
+        "gpu"
+    } else if path.contains("Processors") || path.contains("Memory") {
+        "compute"
+    } else {
+        "health"
+    }
+}
+
+/// A slow batch never takes the lock for the entire batch. A waiting fast scrape
+/// gets the fair mutex before the next slow GET. At most one 30s request delays it.
+pub async fn collect_drive_wear(name: &str, target: &Target, inflight: &Semaphore) -> Collection {
+    let mut out = Collection::failed();
+    out.errors = 0;
+    if !target.slow_drive_wear || target.blocked().await.is_some() {
+        return out;
+    }
+    let read = |path: String| async move {
+        // Acquire the independent slow budget before taking this BMC lock.
+        // Targets waiting for the slow slot must not obstruct baseline scrapes.
+        let _slow_permit = inflight
+            .acquire()
+            .await
+            .map_err(|_| FetchError::Transport)?;
+        let _guard = target.scrape_lock.lock().await;
+        target
+            .get_with_timeout(&path, &Semaphore::new(1), Duration::from_secs(30))
+            .await
+    };
+    let storage =
+        match read("/redfish/v1/Systems/System_0/Storage?$expand=*($levels=1)".into()).await {
+            Ok(value) => value,
+            Err(_) => {
+                out.errors = 1;
+                return out;
+            }
+        };
+    let Some(units) = storage["Members"].as_array() else {
+        out.errors = 1;
+        return out;
+    };
+    if units.len() > 32 || !storage["Members@odata.nextLink"].is_null() {
+        out.errors = 1;
+        return out;
+    }
+    let paths: Vec<String> = units
+        .iter()
+        .flat_map(|unit| refs(unit, "Drives", 17))
+        .collect();
+    if paths.is_empty()
+        || paths.len() > 16
+        || paths
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != paths.len()
+        || units.iter().any(|unit| {
+            unit["Drives"]
+                .as_array()
+                .is_some_and(|links| refs(unit, "Drives", 17).len() != links.len())
+        })
+    {
+        out.errors = 1;
+        return out;
+    }
+    out.up = true;
+    for path in paths {
+        match read(path).await {
+            Ok(value) => metrics::drive_wear(&mut out.samples, &value),
+            Err(error) => {
+                out.errors += 1;
+                tracing::warn!(
+                    target = name,
+                    reason = error.reason(),
+                    "slow Redfish read failed"
+                );
+                if matches!(error, FetchError::Http(403)) {
+                    target.note_forbidden().await;
+                    out.blocked = true;
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 pub struct Collection {
     pub samples: Vec<Metric>,
     pub up: bool,
@@ -297,6 +435,7 @@ pub struct Collection {
     pub errors: u32,
     requests: usize,
     budget_exhausted: bool,
+    pub failed_groups: std::collections::BTreeSet<&'static str>,
 }
 
 impl Collection {
@@ -308,6 +447,7 @@ impl Collection {
             errors: 1,
             requests: 0,
             budget_exhausted: false,
+            failed_groups: Default::default(),
         }
     }
 
@@ -319,9 +459,11 @@ impl Collection {
         path: &str,
     ) -> Option<Value> {
         if self.blocked {
+            self.failed_groups.insert(path_group(path));
             return None;
         }
         if self.requests >= MAX_REQUESTS_PER_SCRAPE {
+            self.failed_groups.insert(path_group(path));
             if !self.budget_exhausted {
                 self.errors = self.errors.saturating_add(1);
                 self.budget_exhausted = true;
@@ -332,6 +474,7 @@ impl Collection {
         match target.get(path, inflight).await {
             Ok(value) => Some(value),
             Err(error) => {
+                self.failed_groups.insert(path_group(path));
                 tracing::warn!(
                     target = name,
                     path,
@@ -358,6 +501,7 @@ impl Collection {
     ) -> Option<Vec<Value>> {
         let collection = self.fetch(name, target, inflight, path).await?;
         let Some(members) = collection["Members"].as_array() else {
+            self.failed_groups.insert(path_group(path));
             self.errors = self.errors.saturating_add(1);
             return None;
         };
@@ -367,11 +511,13 @@ impl Collection {
                 .as_u64()
                 .is_some_and(|count| count != members.len() as u64)
         {
+            self.failed_groups.insert(path_group(path));
             self.errors = self.errors.saturating_add(1);
             return None;
         }
         let paths = refs(&collection, "Members", limit);
         if paths.len() != members.len() {
+            self.failed_groups.insert(path_group(path));
             self.errors = self.errors.saturating_add(1);
             return None;
         }
@@ -387,6 +533,7 @@ impl Collection {
         match advertised["@odata.id"].as_str() {
             Some(path) if safe_path(path) => Some(path.to_owned()),
             _ => {
+                self.failed_groups.insert(path_group(key));
                 self.errors = self.errors.saturating_add(1);
                 None
             }
@@ -434,6 +581,7 @@ async fn collect_cpu(
                     metrics::nvme_count(&mut out.samples, &drives);
                 }
             } else {
+                out.failed_groups.insert("drives");
                 out.errors = out.errors.saturating_add(1);
             }
         }
@@ -496,6 +644,7 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
             errors: 1,
             requests: 0,
             budget_exhausted: false,
+            failed_groups: ["health", "compute", "drives", "network", "power", "gpu"].into(),
         };
     }
     let mut out = Collection {
@@ -505,6 +654,7 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
         errors: 0,
         requests: 1,
         budget_exhausted: false,
+        failed_groups: Default::default(),
     };
     let probe = tokio::time::timeout(
         Duration::from_secs(10),
@@ -592,6 +742,7 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
             .await
         {
             if !metrics::b300_nvme_inventory(&mut out.samples, &storage, &simple) {
+                out.failed_groups.insert("drives");
                 out.errors = out.errors.saturating_add(1);
             }
         }
@@ -723,6 +874,101 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+    #[tokio::test]
+    async fn hung_slow_http_is_deadlined_and_does_not_turn_into_success() {
+        let app = Router::new().fallback(get(|| async {
+            std::future::pending::<Json<Value>>().await
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = Target::mock(&format!("http://{addr}/"));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            target.get_with_timeout(
+                "/redfish/v1/Systems/System_0/Storage",
+                &Semaphore::new(1),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Err(FetchError::Timeout)));
+        let text = metrics::render_slow("fixture", Collection::failed());
+        assert!(text.contains("redfish_group_success{target=\"fixture\",group=\"drive_wear\"} 0"));
+        assert!(!text.contains("redfish_group_last_success_timestamp_seconds"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn optional_wear_reads_only_advertised_details_and_emits_no_inventory() {
+        let app = Router::new().fallback(get(|uri:Uri|async move {Json(match uri.path() {
+            "/redfish/v1/Systems/System_0/Storage"=>json!({"Members":[{"Drives":[{"@odata.id":"/redfish/v1/Systems/System_0/Storage/Unit/Drives/NVMe1"}]}]}),
+            "/redfish/v1/Systems/System_0/Storage/Unit/Drives/NVMe1"=>json!({"Name":"NVMe1","SerialNumber":"fixture","PredictedMediaLifeLeftPercent":90}),
+            _=>json!({}),
+        })}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut target = Target::mock(&format!("http://{addr}/"));
+        assert!(
+            !collect_drive_wear("fixture", &target, &Semaphore::new(1))
+                .await
+                .up
+        );
+        target.slow_drive_wear = true;
+        let result = collect_drive_wear("fixture", &target, &Semaphore::new(1)).await;
+        assert!(result.up);
+        assert_eq!(result.errors, 0);
+        let text = metrics::render_slow("fixture", result);
+        assert!(text.contains("redfish_drive_life_left_percent"));
+        assert!(!text.contains("redfish_nvme_drive_count"));
+        task.abort();
+    }
+    #[tokio::test]
+    async fn queued_baseline_get_precedes_next_slow_get() {
+        let lock = Arc::new(Mutex::new(()));
+        let guard = lock.lock().await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (queued, ready) = tokio::sync::oneshot::channel();
+        let fast_lock = lock.clone();
+        let fast_order = order.clone();
+        let fast = tokio::spawn(async move {
+            queued.send(()).unwrap();
+            let _guard = fast_lock.lock().await;
+            fast_order.lock().await.push("fast");
+        });
+        ready.await.unwrap();
+        let (queued, ready) = tokio::sync::oneshot::channel();
+        let slow_lock = lock.clone();
+        let slow_order = order.clone();
+        let slow = tokio::spawn(async move {
+            queued.send(()).unwrap();
+            let _guard = slow_lock.lock().await;
+            slow_order.lock().await.push("slow");
+        });
+        ready.await.unwrap();
+        drop(guard);
+        fast.await.unwrap();
+        slow.await.unwrap();
+        assert_eq!(*order.lock().await, vec!["fast", "slow"]);
+    }
+    #[tokio::test]
+    async fn saturated_slow_budget_does_not_take_baseline_bmc_lock() {
+        let mut target = Target::mock("http://127.0.0.1:1/");
+        target.slow_drive_wear = true;
+        let target = Arc::new(target);
+        let worker_target = target.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            started.send(()).unwrap();
+            collect_drive_wear("fixture", &worker_target, &Semaphore::new(0)).await
+        });
+        ready.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(target.scrape_lock.try_lock().is_ok());
+        worker.abort();
+    }
 
     #[test]
     fn rejects_ssrf_and_unsafe_references() {
@@ -739,7 +985,8 @@ mod tests {
                 username: "a".into(),
                 password: "b".into(),
                 insecure_tls: true,
-                profile: Profile::AsrockrackB3008u16x
+                profile: Profile::AsrockrackB3008u16x,
+                slow_drive_wear: false
             })
             .is_err());
         }

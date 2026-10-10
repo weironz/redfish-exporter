@@ -2,7 +2,7 @@ use crate::bmc::Collection;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Metric {
     name: &'static str,
     labels: Vec<(&'static str, String)>,
@@ -310,6 +310,92 @@ pub fn drive(out: &mut Vec<Metric>, value: &Value) {
     if let Some(v) = number(&value["CapacityBytes"]) {
         add(out, "redfish_drive_capacity_bytes", labels, v);
     }
+}
+
+pub fn drive_wear(out: &mut Vec<Metric>, value: &Value) {
+    if let Some(v) =
+        number(&value["PredictedMediaLifeLeftPercent"]).filter(|v| (0.0..=100.0).contains(v))
+    {
+        add(
+            out,
+            "redfish_drive_life_left_percent",
+            vec![
+                ("name", string(&value["Name"])),
+                ("serial", string(&value["SerialNumber"])),
+            ],
+            v,
+        );
+    }
+}
+
+fn group(name: &str) -> Option<&'static str> {
+    if name.starts_with("redfish_drive_") || name == "redfish_nvme_drive_count" {
+        Some("drives")
+    } else if name.starts_with("redfish_cpu_")
+        || name.starts_with("redfish_dimm_")
+        || name == "redfish_memory_total_bytes"
+    {
+        Some("compute")
+    } else if name.starts_with("redfish_gpu_") {
+        Some("gpu")
+    } else if name.contains("nic_") {
+        Some("network")
+    } else if name.contains("power_")
+        || name.contains("psu_")
+        || name.contains("fan_")
+        || name.contains("temperature_")
+    {
+        Some("power")
+    } else if name.ends_with("_health") || name.ends_with("_info") {
+        Some("health")
+    } else {
+        None
+    }
+}
+
+fn epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0., |d| d.as_secs_f64())
+}
+
+/// Cached slow values retain the observation timestamp in Prometheus text format;
+/// repeated reads do not turn a cached sample into newly observed hardware data.
+pub fn render_slow(target: &str, mut result: Collection) -> String {
+    let observed = epoch();
+    let present = !result.samples.is_empty();
+    for (metric, value) in [
+        (
+            "redfish_group_success",
+            f64::from(present && result.errors == 0 && !result.blocked),
+        ),
+        ("redfish_group_last_attempt_timestamp_seconds", observed),
+    ] {
+        add(
+            &mut result.samples,
+            metric,
+            vec![("group", "drive_wear".into())],
+            value,
+        );
+    }
+    if present && result.errors == 0 && !result.blocked {
+        add(
+            &mut result.samples,
+            "redfish_group_last_success_timestamp_seconds",
+            vec![("group", "drive_wear".into())],
+            observed,
+        );
+    }
+    let text = render(target, result, 0.);
+    text.lines()
+        .map(|line| {
+            if line.starts_with('#') {
+                format!("{line}\n")
+            } else {
+                format!("{line} {}\n", (observed * 1000.) as u64)
+            }
+        })
+        .collect()
 }
 
 pub fn nics(out: &mut Vec<Metric>, value: &Value, kind: &'static str) {
@@ -625,6 +711,47 @@ fn escape_label(value: &str) -> String {
 }
 
 pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
+    let observed = epoch();
+    let present: BTreeSet<_> = result
+        .samples
+        .iter()
+        .filter_map(|m| group(m.name))
+        .collect();
+    // Request success is not component health. Missing groups remain unknown.
+    let baseline = !result.samples.iter().any(|m| {
+        m.labels
+            .iter()
+            .any(|(key, value)| *key == "group" && value == "drive_wear")
+    });
+    for id in ["health", "compute", "drives", "network", "power", "gpu"]
+        .into_iter()
+        .filter(|_| baseline)
+    {
+        let successful = result.up
+            && !result.blocked
+            && present.contains(id)
+            && !result.failed_groups.contains(id);
+        add(
+            &mut result.samples,
+            "redfish_group_success",
+            vec![("group", id.into())],
+            f64::from(successful),
+        );
+        add(
+            &mut result.samples,
+            "redfish_group_last_attempt_timestamp_seconds",
+            vec![("group", id.into())],
+            observed,
+        );
+        if successful {
+            add(
+                &mut result.samples,
+                "redfish_group_last_success_timestamp_seconds",
+                vec![("group", id.into())],
+                observed,
+            );
+        }
+    }
     add(
         &mut result.samples,
         "redfish_up",
@@ -677,6 +804,41 @@ pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn group_failure_is_independent_and_missing_groups_are_not_successful() {
+        let mut result = Collection::failed();
+        result.up = true;
+        result.failed_groups.insert("drives");
+        system(&mut result.samples, &json!({"Status":{"Health":"OK"}}));
+        drive(&mut result.samples, &json!({"Status":{"Health":"OK"}}));
+        let text = render("fixture", result, 1.);
+        assert!(text.contains("redfish_group_success{target=\"fixture\",group=\"health\"} 1"));
+        assert!(text.contains("redfish_group_success{target=\"fixture\",group=\"drives\"} 0"));
+        assert!(text.contains("redfish_group_success{target=\"fixture\",group=\"gpu\"} 0"));
+        assert!(!text.contains(
+            "redfish_group_last_success_timestamp_seconds{target=\"fixture\",group=\"drives\"}"
+        ));
+    }
+    #[test]
+    fn slow_snapshot_has_original_timestamps_and_never_replays_baseline_inventory() {
+        let mut result = Collection::failed();
+        result.up = true;
+        result.errors = 0;
+        drive_wear(
+            &mut result.samples,
+            &json!({"Name":"Disk", "SerialNumber":"fixture", "PredictedMediaLifeLeftPercent":89}),
+        );
+        let snapshot = render_slow("fixture", result);
+        assert!(snapshot.contains("redfish_drive_life_left_percent"));
+        assert!(!snapshot.contains("redfish_drive_capacity_bytes"));
+        assert!(!snapshot.contains("group=\"drives\""));
+        assert!(snapshot
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .all(|line| line.split_whitespace().count() == 3));
+        let replay = snapshot.clone();
+        assert_eq!(replay, snapshot); // cached text, not regenerated on subsequent scrape.
+    }
 
     #[test]
     fn reports_gpu_telemetry_without_dram_temperature_confusion() {

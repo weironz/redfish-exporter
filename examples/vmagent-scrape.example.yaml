@@ -15,3 +15,19 @@
         device_type: gpu_server
         cluster: chonburi-b300
   sample_limit: 20000
+
+# Optional only after slow_drive_wear=true is explicitly installed in the private
+# target file. This job only reads a snapshot; do not deploy by default.
+# - job_name: b300-redfish-drive-wear
+#   metrics_path: /slow-metrics
+#   scrape_interval: 1800s
+#   scrape_timeout: 5s
+#   honor_timestamps: true
+#   params:
+#     target: [B300-01]
+#   static_configs:
+#     - targets: [127.0.0.1:19626]
+#   metric_relabel_configs:
+#     - source_labels: [__name__]
+#       action: keep
+#       regex: redfish_drive_life_left_percent|redfish_group_.*
