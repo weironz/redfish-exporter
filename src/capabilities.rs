@@ -23,7 +23,7 @@ mod tests {
         let fixtures: Vec<Value> =
             serde_json::from_str(include_str!("../tests/fixtures/provider-contract-v1.json"))
                 .unwrap();
-        assert_eq!(fixtures.len(), 3);
+        assert_eq!(fixtures.len(), 4);
         for fixture in fixtures {
             assert_eq!(
                 profile(
@@ -36,11 +36,12 @@ mod tests {
         }
     }
     #[test]
-    fn three_profiles_distinguish_conditional_and_unsupported_without_fake_values() {
+    fn four_profiles_distinguish_conditional_and_unsupported_without_fake_values() {
         for (id, model, kind) in [
             ("asrockrack_b300_8u16x", "8U16X-GNR2", "gpu_server"),
             ("tyan_b8037", "B8037T73X4-200PE4HR-L", "cpu_server"),
             ("asrockrack_1u10e", "1U10E-ICX2", "cpu_server"),
+            ("asrockrack_1u12e", "1U12E-EGS2-EVAC", "cpu_server"),
         ] {
             let doc = profile(id, model, kind);
             assert_eq!(doc["schema"], SCHEMA);

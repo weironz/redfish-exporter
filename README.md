@@ -1,6 +1,6 @@
 # redfish-exporter
 
-Independent, read-only Rust Prometheus exporter for three server families: ASRockRack 8U16X-GNR2 B300, TYAN B8037T73X4-200PE4HR-L, and ASRockRack 1U10E-ICX2. It runs on an IDC management host, outside the rented server OS. It does not perform Redfish writes, power operations, firmware updates, or console probing.
+Independent, read-only Rust Prometheus exporter for four server families: ASRockRack 8U16X-GNR2 B300, TYAN B8037T73X4-200PE4HR-L, ASRockRack 1U10E-ICX2, and ASRockRack 1U12E-EGS2-EVAC. It runs on an IDC management host, outside the rented server OS. It does not perform Redfish writes, power operations, firmware updates, or console probing.
 
 ## Why separate from NeoStor Agent
 
@@ -19,7 +19,7 @@ No new IDC inbound firewall port is required. This exporter never requires tenan
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-docker build -t redfish-exporter:v0.2.2 .
+docker build -t redfish-exporter:v0.2.3 .
 ```
 
 The container image is built locally; this repository does not automatically publish or deploy it. NeoStor's optional Compose `redfish` profile can reference a version-pinned image from an approved registry or a locally loaded image.
@@ -37,8 +37,9 @@ Select a versioned profile per target. `profile` is an exact allowlisted value, 
 | `asrockrack_b300_8u16x` | `/Systems/System_0`, `/Managers/BMC_0`, HGX | Expanded `Storage` + `SimpleStorage` inventories, plus B300-specific telemetry reports |
 | `tyan_b8037` | `/Systems/Self`, `/Managers/Self`, `/Chassis/Self` | Follow advertised collection links, fetch members individually; no `$expand` |
 | `asrockrack_1u10e` | `/Systems/Self`, `/Managers/Self`, `/Chassis/Self` | Follow advertised collection links plus Thermal, Power and Sensors when present; no `$expand` |
+| `asrockrack_1u12e` | Live system discovery: `/Systems/Self` (Redfish 1.15.1) | Distinct CPU profile, advertised processor/memory/storage links; offline-tested CPU collector, full live scrape still requires acceptance |
 
-Both CPU profiles collect system/chassis health, power state, CPU/DIMM inventory, storage and NIC details when the BMC advertises them. Thermal, PSU and sensor metrics appear only for advertised, successfully read resources. Missing links do not become zeros. No CPU model is queried for HGX/GPU endpoints. Profile differences and paths are grounded in the existing read-only capability surveys; real output values still require one authorized canary per model and firmware version.
+CPU profiles collect system/chassis health, power state, CPU/DIMM inventory, storage and NIC details when the BMC advertises them. Thermal, PSU and sensor metrics appear only for advertised, successfully read resources. Missing links do not become zeros. No CPU model is queried for HGX/GPU endpoints. Profile differences and paths are grounded in read-only capability surveys; real output values still require one authorized canary per model and firmware version. ReadyIDC's 1U12E system reports board model `SP2C741D32TM3`; this is retained as observed BMC inventory, not used to overwrite the operator-declared chassis model `1U12E-EGS2-EVAC`.
 
 Environment variables:
 

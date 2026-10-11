@@ -177,6 +177,14 @@ async fn slow_metrics(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!(
+            "redfish-exporter v{} ({})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::var("REDFISH_EXPORTER_BUILD_SHA").unwrap_or_else(|_| "unknown".into())
+        );
+        return Ok(());
+    }
     tracing_subscriber::fmt::init();
     let path = std::env::var("REDFISH_EXPORTER_TARGETS_FILE")
         .unwrap_or_else(|_| "/run/secrets/redfish-targets.json".into());

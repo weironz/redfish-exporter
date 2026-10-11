@@ -23,6 +23,8 @@ enum Profile {
     TyanB8037,
     #[serde(rename = "asrockrack_1u10e")]
     Asrockrack1u10e,
+    #[serde(rename = "asrockrack_1u12e")]
+    Asrockrack1u12e,
 }
 
 impl Profile {
@@ -31,6 +33,7 @@ impl Profile {
             Self::AsrockrackB3008u16x => "asrockrack_b300_8u16x",
             Self::TyanB8037 => "tyan_b8037",
             Self::Asrockrack1u10e => "asrockrack_1u10e",
+            Self::Asrockrack1u12e => "asrockrack_1u12e",
         }
     }
 
@@ -39,20 +42,23 @@ impl Profile {
             Self::AsrockrackB3008u16x => "8U16X-GNR2",
             Self::TyanB8037 => "B8037T73X4-200PE4HR-L",
             Self::Asrockrack1u10e => "1U10E-ICX2",
+            Self::Asrockrack1u12e => "1U12E-EGS2-EVAC",
         }
     }
 
     fn device_type(self) -> &'static str {
         match self {
             Self::AsrockrackB3008u16x => "gpu_server",
-            Self::TyanB8037 | Self::Asrockrack1u10e => "cpu_server",
+            Self::TyanB8037 | Self::Asrockrack1u10e | Self::Asrockrack1u12e => "cpu_server",
         }
     }
 
     fn system_path(self) -> &'static str {
         match self {
             Self::AsrockrackB3008u16x => "/redfish/v1/Systems/System_0",
-            Self::TyanB8037 | Self::Asrockrack1u10e => "/redfish/v1/Systems/Self",
+            Self::TyanB8037 | Self::Asrockrack1u10e | Self::Asrockrack1u12e => {
+                "/redfish/v1/Systems/Self"
+            }
         }
     }
 }
@@ -1006,6 +1012,7 @@ mod tests {
             ("asrockrack_b300_8u16x", Profile::AsrockrackB3008u16x),
             ("tyan_b8037", Profile::TyanB8037),
             ("asrockrack_1u10e", Profile::Asrockrack1u10e),
+            ("asrockrack_1u12e", Profile::Asrockrack1u12e),
         ] {
             let config: TargetConfig = serde_json::from_value(json!({
                 "address":"10.0.0.1", "username":"test", "password":"secret", "profile":id
@@ -1198,7 +1205,16 @@ mod tests {
         assert!(
             output.contains("redfish_gpu_temperature_celsius{target=\"B300-01\",gpu=\"GPU_0\"} 51")
         );
-        assert!(!output.contains("75"));
+        // Freshness timestamps may contain "75"; inspect the temperature series,
+        // not unrelated numbers elsewhere in the exposition.
+        let gpu_temperatures: Vec<_> = output
+            .lines()
+            .filter(|line| line.starts_with("redfish_gpu_temperature_celsius{"))
+            .collect();
+        assert_eq!(
+            gpu_temperatures,
+            ["redfish_gpu_temperature_celsius{target=\"B300-01\",gpu=\"GPU_0\"} 51"]
+        );
     }
 
     #[tokio::test]
@@ -1206,6 +1222,7 @@ mod tests {
         for (profile, expected_model, has_sensors) in [
             (Profile::TyanB8037, "B8037T73X4-200PE4HR-L", false),
             (Profile::Asrockrack1u10e, "1U10E-ICX2", true),
+            (Profile::Asrockrack1u12e, "SP2C741D32TM3", true),
         ] {
             let paths = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
             let seen = paths.clone();
@@ -1235,11 +1252,20 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let target = Target::mock_profile(&format!("http://{addr}/"), profile);
+            assert_eq!(target.capabilities()["model"], profile.model());
+            if profile == Profile::Asrockrack1u12e {
+                assert_eq!(target.capabilities()["model"], "1U12E-EGS2-EVAC");
+                assert_ne!(profile.model(), expected_model);
+            }
             let result = collect("CPU-01", &target, &Semaphore::new(4)).await;
+            assert!(result.up);
             let output = metrics::render("CPU-01", result, 0.1);
             assert!(output.contains("redfish_cpu_count{target=\"CPU-01\"} 1"));
             assert!(output.contains("redfish_memory_total_bytes{target=\"CPU-01\"} 34359738368"));
-            assert!(output.contains(&format!("model=\"{expected_model}\"")));
+            assert!(output.contains(&format!("model=\"{}\"", profile.model())));
+            if profile == Profile::Asrockrack1u12e {
+                assert!(!output.contains("model=\"SP2C741D32TM3\""));
+            }
             assert_eq!(
                 output.contains("redfish_sensor_temperature_celsius"),
                 has_sensors
