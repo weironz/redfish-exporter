@@ -9,6 +9,7 @@ use std::{
 };
 use tokio::sync::{Mutex, Semaphore};
 
+mod cpu_members;
 mod sensors;
 
 const MAX_BODY: usize = 4 * 1024 * 1024;
@@ -108,6 +109,7 @@ pub struct Target {
     pub slow_snapshot: Mutex<Option<String>>,
     pub slow_due: Mutex<Option<Instant>>,
     sensors: Mutex<sensors::Cache>,
+    cpu_members: Mutex<cpu_members::Cache>,
 }
 
 #[derive(Debug)]
@@ -197,6 +199,7 @@ impl Target {
             slow_snapshot: Mutex::new(None),
             slow_due: Mutex::new(None),
             sensors: Mutex::new(sensors::Cache::default()),
+            cpu_members: Mutex::new(cpu_members::Cache::default()),
         })
     }
 
@@ -558,13 +561,22 @@ async fn collect_cpu(
     out: &mut Collection,
     system: &Value,
 ) {
+    let rolling = target.profile == Profile::Asrockrack1u12e;
+    let mut specs = Vec::new();
+    if rolling {
+        collect_cpu_chassis(name, target, inflight, out).await;
+    }
     if let Some(path) = out.advertised_link(system, "Processors") {
-        if let Some(items) = out.fetch_members(name, target, inflight, &path, 8).await {
+        if rolling {
+            specs.push(cpu_members::Spec::new("processors", path, 8));
+        } else if let Some(items) = out.fetch_members(name, target, inflight, &path, 8).await {
             metrics::processors(&mut out.samples, &serde_json::json!({"Members": items}));
         }
     }
     if let Some(path) = out.advertised_link(system, "Memory") {
-        if let Some(items) = out.fetch_members(name, target, inflight, &path, 64).await {
+        if rolling {
+            specs.push(cpu_members::Spec::new("memory", path, 64));
+        } else if let Some(items) = out.fetch_members(name, target, inflight, &path, 64).await {
             metrics::memory(&mut out.samples, &serde_json::json!({"Members": items}));
         }
     }
@@ -597,7 +609,9 @@ async fn collect_cpu(
         }
     }
     if let Some(path) = out.advertised_link(system, "EthernetInterfaces") {
-        if let Some(items) = out.fetch_members(name, target, inflight, &path, 16).await {
+        if rolling {
+            specs.push(cpu_members::Spec::new("onboard", path, 16));
+        } else if let Some(items) = out.fetch_members(name, target, inflight, &path, 16).await {
             metrics::nics(
                 &mut out.samples,
                 &serde_json::json!({"Members": items}),
@@ -611,7 +625,9 @@ async fn collect_cpu(
     {
         metrics::manager(&mut out.samples, &manager);
         if let Some(path) = out.advertised_link(&manager, "EthernetInterfaces") {
-            if let Some(items) = out.fetch_members(name, target, inflight, &path, 8).await {
+            if rolling {
+                specs.push(cpu_members::Spec::new("bmc", path, 8));
+            } else if let Some(items) = out.fetch_members(name, target, inflight, &path, 8).await {
                 metrics::nics(
                     &mut out.samples,
                     &serde_json::json!({"Members": items}),
@@ -620,6 +636,19 @@ async fn collect_cpu(
             }
         }
     }
+    if rolling {
+        cpu_members::collect(name, target, inflight, out, specs).await;
+    } else {
+        collect_cpu_chassis(name, target, inflight, out).await;
+    }
+}
+
+async fn collect_cpu_chassis(
+    name: &str,
+    target: &Target,
+    inflight: &Semaphore,
+    out: &mut Collection,
+) {
     if let Some(chassis) = out
         .fetch(name, target, inflight, "/redfish/v1/Chassis/Self")
         .await
@@ -1221,6 +1250,87 @@ mod tests {
             gpu_temperatures,
             ["redfish_gpu_temperature_celsius{target=\"B300-01\",gpu=\"GPU_0\"} 51"]
         );
+    }
+
+    #[tokio::test]
+    async fn full_cpu_inventory_and_136_sensors_converge_in_three_bounded_rounds() {
+        let paths = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = paths.clone();
+        let app = Router::new().fallback(get(move |uri: Uri| {
+            seen.lock().unwrap().push(uri.to_string());
+            async move {
+                let root = "/redfish/v1/Chassis/Self/Sensors";
+                let collection = |path: &str, count: usize| json!({"Members@odata.count":count,"Members":(0..count).map(|i| json!({"@odata.id":format!("{path}/{i}")})).collect::<Vec<_>>()});
+                let value = match uri.path() {
+                    "/redfish/v1/Systems/Self" => json!({"Status":{"Health":"OK"},"Processors":{"@odata.id":"/redfish/v1/Systems/Self/Processors"},"Memory":{"@odata.id":"/redfish/v1/Systems/Self/Memory"},"EthernetInterfaces":{"@odata.id":"/redfish/v1/Systems/Self/EthernetInterfaces"}}),
+                    "/redfish/v1/Systems/Self/Processors" => collection(uri.path(),8),
+                    "/redfish/v1/Systems/Self/Memory" => collection(uri.path(),64),
+                    "/redfish/v1/Systems/Self/EthernetInterfaces" => collection(uri.path(),16),
+                    "/redfish/v1/Managers/Self" => json!({"EthernetInterfaces":{"@odata.id":"/redfish/v1/Managers/Self/EthernetInterfaces"}}),
+                    "/redfish/v1/Managers/Self/EthernetInterfaces" => collection(uri.path(),8),
+                    "/redfish/v1/Chassis/Self" => json!({"Sensors":{"@odata.id":root}}),
+                    path if path==root => {
+                        let skip=uri.query().and_then(|q| q.strip_prefix("$skip=")).and_then(|q| q.parse::<usize>().ok()).unwrap_or(0);
+                        let end=(skip+50).min(136);
+                        let mut page=json!({"Members@odata.count":136,"Members":(skip..end).map(|i| json!({"@odata.id":format!("{root}/{i}")})).collect::<Vec<_>>()});
+                        if end<136 { page["Members@odata.nextLink"]=json!(format!("{root}?$skip={end}")); }
+                        page
+                    },
+                    path if path.starts_with(&format!("{root}/")) => json!({"Name":path,"ReadingType":"Temperature","ReadingUnits":"Cel","Reading":42,"Status":{"Health":"OK"}}),
+                    path if path.contains("/Processors/") => json!({"ProcessorType":"CPU","Socket":path,"Status":{"Health":"OK"}}),
+                    path if path.contains("/Memory/") => json!({"Name":path,"CapacityMiB":32768,"Status":{"Health":"OK"}}),
+                    path if path.contains("/EthernetInterfaces/") => json!({"Id":path,"MACAddress":path,"LinkStatus":"LinkUp","SpeedMbps":1000}),
+                    _ => json!({"Members":[]}),
+                };
+                Json(value)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = Target::mock_profile(&format!("http://{addr}/"), Profile::Asrockrack1u12e);
+        let mut first_dimm_observation = None;
+        for round in 0..18 {
+            if round > 0 {
+                target
+                    .cpu_members
+                    .lock()
+                    .await
+                    .age_by(Duration::from_secs(600));
+                target.sensors.lock().await.age_by(Duration::from_secs(600));
+            }
+            let cached = [48, 96, 136][round.min(2)];
+            paths.lock().unwrap().clear();
+            let result = collect("CPU", &target, &Semaphore::new(1)).await;
+            assert!(result.requests <= MAX_REQUESTS_PER_SCRAPE);
+            let output = metrics::render("CPU", result, 0.1);
+            assert!(
+                output.contains(&format!(
+                    "redfish_sensor_cached_count{{target=\"CPU\"}} {cached}"
+                )),
+                "round {round}: sensors must not be starved"
+            );
+            let dimm = output.lines().find(|line| {
+                line.starts_with("redfish_dimm_health{")
+                    && line.contains("slot=\"/redfish/v1/Systems/Self/Memory/0\"")
+            });
+            if round == 0 {
+                first_dimm_observation =
+                    Some(dimm.expect("first round has a DIMM observation").to_owned());
+            }
+            if round == 1 {
+                // The missing-first global queue keeps this old sample intact.
+                assert_eq!(dimm, first_dimm_observation.as_deref());
+            }
+            if round >= 2 {
+                assert!(output.contains("redfish_cpu_count{target=\"CPU\"} 8"));
+                assert!(output.contains("redfish_dimm_count{target=\"CPU\"} 64"));
+                assert!(output.contains("redfish_onboard_nic_count{target=\"CPU\"} 16"));
+                assert!(output.contains("redfish_scrape_complete{target=\"CPU\"} 1"));
+            }
+            assert!(paths.lock().unwrap().len() <= MAX_REQUESTS_PER_SCRAPE);
+        }
+        task.abort();
     }
 
     #[tokio::test]

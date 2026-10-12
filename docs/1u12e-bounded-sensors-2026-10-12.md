@@ -10,7 +10,7 @@ ReadyIDC `CPU-Server-02` / `10.1.40.51` / `asrockrack_1u12e` 的 v0.2.3 自然�
 
 1. 仅 1U12E profile 的 Sensors 走新适配器；其他 CPU、B300 与慢盘策略保持原路径。
 2. 每轮发现完整目录，最多 8 页、256 个唯一成员；成员必须在原 Chassis Sensors 目录下。nextLink 仅允许同一相对资源的数字 `$skip` / `$top`，offset 严格增加；拒绝跳地址/资源、重复成员、分页循环、`$expand`、错误总数和超限。
-3. 每轮最多 48 个详情 GET，同时服从原有整轮 96 请求、单 BMC 串行与 140 秒总时限；没有增大预算。136 个详情在三个成功的自然轮次中覆盖，600s 周期下约 20 分钟预热。不能承诺首轮完整。
+3. 每轮最多 48 个详情 GET，同时服从原有整轮 96 请求、单 BMC 串行与 140 秒总时限；没有增大预算。**只有基础采集和目录读取后每轮仍剩至少 48 次预算**，136 个详情才可在三个成功的自然轮次中覆盖，600s 周期下约 20 分钟预热。真实灰度已发现该前提不成立，见下节。不能承诺首轮或三轮必然完整。
 4. 缓存只保存有界指标，不保存整份可能很大的响应。目录改变清空旧缓存；超过 1800s 的观测不输出。失败成员不会沿用旧成功值掩盖故障；403 仍停止后续 GET 并退避。
 5. 保留每个传感器原始 Prometheus 样本时间和源时间指标，`sensor_id` 区分重名。power 组成功时间为其最老的传感器观测，不是 HTTP 响应生成时间。
 6. `redfish_sensor_inventory_count` 为实测目录大小，不是员工声明的期望基线；cached_count / snapshot_complete 为覆盖诊断。预热、过期、失败或目录不完整仍是 partial。硬件健康与采集成功继续分开。
@@ -29,7 +29,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-本机终态为 36 passed、0 failed、0 ignored，fmt 与严格 Clippy 成功。GitHub Linux / Docker CI 终态另行登记。离线通过不能替代实机验收；当前 v0.2.4 未发布或部署。
+初始候选本机验证为 36 passed、0 failed、0 ignored，fmt 与严格 Clippy 成功。当时 v0.2.4 尚未发布或部署；后续发布、实机发现及补充测试见下节。离线通过不能替代实机验收。
 
 ## 必须保留的实机门禁
 
@@ -39,3 +39,17 @@ cargo clippy --locked --all-targets -- -D warnings
 - 核对真实 BMC nextLink 格式是否在已实现的数字分页范围内；不支持的格式保留 partial 并补适配，不猜测其他 URL。
 - NVMe 无数据仍须独立判定 BMC 能力，不能随着 Sensors 修复宣称完整磁盘资产验收。
 - 真实 Web 图表显示及两地全量接入仍为独立未完成项。
+
+## 2026-10-12 ReadyIDC v0.2.4 灰度未通过：剩余预算与有效期不匹配
+
+用户批准两阶段门禁后，仅 ReadyIDC 原三台只读灰度升级到 Agent v0.0.23 / exporter v0.2.4。镜像由 UFM 从 DockerHub 拉取；exporter 源码为 `d99ced079225c7e3911c91a367165ebd6186ad3e`，固定镜像 digest 为 `sha256:3e08ec6dd867115e28aba95d0b1a80afe5e3a287351771699a28a99e8173f393`。Agent UUID/token、私有配置、控制日志及指标队列保留，未扩大设备范围、未改 Datazone、未操作 BMC 电源或控制台。
+
+CPU-Server-02 首次自然采集时间 `2026-10-12T14:07:36.402Z`：HTTP up=1，耗时 5.622s，目录 136 项，缓存仅 27 项，snapshot_complete=0、power 组失败、scrape_errors=1；未发现 Redfish read failed 请求日志。27 个源时间均与存储中的原始样本时间匹配，未被改写成上行包时间。HTTP 可用不是完整验收。
+
+代码已核对：96 次为**整轮**预算，Sensors 只能用其剩余额度。48 是上限而非保证值。首轮 27 项与详情读取前已消耗 69 次请求的路径吻合；具体各资源占用的分解尚无实时请求计数证据，不能断言是 Memory、PCIe 或磁盘造成。现有三轮模拟的基础资源过少，漏掉了预算竞争。
+
+新增离线诊断测试 `constrained_sensor_budget_cannot_converge_before_cache_expiry`：模型明确设置目录读取后剩 27 次预算，模拟十二轮 600s 周期、1800s 过期，覆盖始终不完整，最大仅 81 项。它验证失败机制和如实 partial，**不是已经修好**；不向真实 BMC 发请求、不增大生产预算。
+
+补充后的本地 `cargo test --locked` 为 37 passed、0 failed、0 ignored；严格 Clippy、fmt 检查通过。此次只修改测试与文档，生产实现、版本号和已发布镜像没有改动。
+
+结论：不能把“分页发现成功”当“三轮全覆盖成功”。中心 v0.0.23 发布必须停止，保持 v0.0.21；NVMe 缺数据、真实 Web 面板仍不能宣称验收通过。后续候选应解决基础资源与传感器的预算调度/新鲜度可达性，补真实资源规模测试和可观测预算，再经新版本固定来源测试及单独部署批准。不得覆盖已发布 v0.2.4 标签，也不得通过增加请求量、延长有效期或伪造源时间来绕过门禁。

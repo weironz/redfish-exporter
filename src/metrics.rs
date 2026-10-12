@@ -447,6 +447,57 @@ pub fn nics(out: &mut Vec<Metric>, value: &Value, kind: &'static str) {
     }
 }
 
+/// Rolling 1U12E members keep their own observation time. Aggregates require a
+/// complete directory and use the oldest contributing observation, not replay time.
+pub(crate) fn cpu_inventory_observations(
+    out: &mut Vec<Metric>,
+    kind: &'static str,
+    values: &[(&str, &Value, u64)],
+    complete: bool,
+) {
+    let encode = |samples: &mut Vec<Metric>, value: &Value| match kind {
+        "processors" => processors(samples, value),
+        "memory" => memory(samples, value),
+        "onboard" | "bmc" => nics(samples, value, kind),
+        _ => {}
+    };
+    let aggregate = |sample: &Metric| {
+        matches!(
+            sample.name,
+            "redfish_cpu_count"
+                | "redfish_dimm_count"
+                | "redfish_memory_total_bytes"
+                | "redfish_onboard_nic_count"
+                | "redfish_onboard_nic_up_count"
+        )
+    };
+    for (path, value, source) in values {
+        let mut samples = Vec::new();
+        encode(&mut samples, &serde_json::json!({"Members":[value]}));
+        for mut sample in samples.into_iter().filter(|sample| !aggregate(sample)) {
+            sample.source_ms = Some(*source);
+            sample.labels.push(("resource_id", (*path).into()));
+            out.push(sample);
+        }
+    }
+    if complete {
+        let mut samples = Vec::new();
+        encode(
+            &mut samples,
+            &serde_json::json!({"Members":values.iter().map(|(_,v,_)| *v).collect::<Vec<_>>()}),
+        );
+        let oldest = values
+            .iter()
+            .map(|(_, _, source)| *source)
+            .min()
+            .unwrap_or_else(|| (epoch() * 1000.) as u64);
+        for mut sample in samples.into_iter().filter(aggregate) {
+            sample.source_ms = Some(oldest);
+            out.push(sample);
+        }
+    }
+}
+
 pub fn manager(out: &mut Vec<Metric>, value: &Value) {
     add(
         out,
@@ -848,6 +899,43 @@ pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn rolling_cpu_members_keep_individual_time_and_complete_aggregates_use_oldest_source() {
+        let a = json!({"Name":"same-name","CapacityMiB":32768,"Status":{"Health":"OK"}});
+        let b = json!({"Name":"same-name","CapacityMiB":32768,"Status":{"Health":"Warning"}});
+        let values = [
+            ("/redfish/v1/Systems/Self/Memory/0", &a, 1700000000123),
+            ("/redfish/v1/Systems/Self/Memory/1", &b, 1700000100123),
+        ];
+        let render_members = |complete| {
+            let mut out = Collection::failed();
+            out.up = true;
+            out.errors = 0;
+            cpu_inventory_observations(&mut out.samples, "memory", &values, complete);
+            render("CPU", out, 0.1)
+        };
+        let text = render_members(true);
+        let health = text
+            .lines()
+            .filter(|line| line.starts_with("redfish_dimm_health{"))
+            .collect::<Vec<_>>();
+        assert_eq!(health.len(), 2);
+        assert!(
+            health[0].contains("resource_id=\"/redfish/v1/Systems/Self/Memory/0\"")
+                && health[0].ends_with(" 1700000000123")
+        );
+        assert!(
+            health[1].contains("resource_id=\"/redfish/v1/Systems/Self/Memory/1\"")
+                && health[1].ends_with(" 1700000100123")
+        );
+        assert!(text.contains("redfish_dimm_count{target=\"CPU\"} 2 1700000000123"));
+        assert!(text.contains("redfish_group_last_success_timestamp_seconds{target=\"CPU\",group=\"compute\"} 1700000000.123"));
+        let partial = render_members(false);
+        assert!(
+            partial.contains("redfish_dimm_health{") && !partial.contains("redfish_dimm_count{")
+        );
+    }
     #[test]
     fn rolling_sensor_values_and_group_freshness_use_the_original_observation() {
         let mut result = Collection::failed();
