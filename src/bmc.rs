@@ -9,6 +9,8 @@ use std::{
 };
 use tokio::sync::{Mutex, Semaphore};
 
+mod sensors;
+
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const BACKOFF_BASE: u64 = 180;
 const BACKOFF_MAX: u64 = 1800;
@@ -105,6 +107,7 @@ pub struct Target {
     pub slow_lock: Mutex<()>,
     pub slow_snapshot: Mutex<Option<String>>,
     pub slow_due: Mutex<Option<Instant>>,
+    sensors: Mutex<sensors::Cache>,
 }
 
 #[derive(Debug)]
@@ -193,6 +196,7 @@ impl Target {
             slow_lock: Mutex::new(()),
             slow_snapshot: Mutex::new(None),
             slow_due: Mutex::new(None),
+            sensors: Mutex::new(sensors::Cache::default()),
         })
     }
 
@@ -318,7 +322,7 @@ fn safe_path(path: &str) -> bool {
         && !path.contains("..")
         && path
             .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b"/_-.$?=()*".contains(&c))
+            .all(|c| c.is_ascii_alphanumeric() || b"/_-.$?=()*&".contains(&c))
 }
 
 fn refs(value: &Value, key: &str, max: usize) -> Vec<String> {
@@ -632,7 +636,9 @@ async fn collect_cpu(
             }
         }
         if let Some(path) = out.advertised_link(&chassis, "Sensors") {
-            if let Some(items) = out.fetch_members(name, target, inflight, &path, 64).await {
+            if target.profile == Profile::Asrockrack1u12e {
+                sensors::collect(name, target, inflight, out, &path).await;
+            } else if let Some(items) = out.fetch_members(name, target, inflight, &path, 64).await {
                 for sensor in items {
                     metrics::sensor(&mut out.samples, &sensor);
                 }
@@ -1215,6 +1221,89 @@ mod tests {
             gpu_temperatures,
             ["redfish_gpu_temperature_celsius{target=\"B300-01\",gpu=\"GPU_0\"} 51"]
         );
+    }
+
+    #[tokio::test]
+    async fn paginated_136_sensors_converge_without_exceeding_request_budget() {
+        let paths = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = paths.clone();
+        let app = Router::new().fallback(get(move |uri: Uri| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(uri.to_string());
+                let root = "/redfish/v1/Chassis/Self/Sensors";
+                let value = if uri.path() == "/redfish/v1/Systems/Self" {
+                    json!({"Status":{"Health":"OK"}})
+                } else if uri.path() == "/redfish/v1/Chassis/Self" {
+                    json!({"Sensors":{"@odata.id":root}})
+                } else if uri.path() == root {
+                    let skip = uri.query().and_then(|q| q.strip_prefix("$skip="))
+                        .and_then(|q| q.parse::<usize>().ok()).unwrap_or(0);
+                    let end = (skip + 50).min(136);
+                    let mut value = json!({"Members@odata.count":136,"Members":
+                        (skip..end).map(|i| json!({"@odata.id":format!("{root}/{i}")})).collect::<Vec<_>>()});
+                    if end < 136 { value["Members@odata.nextLink"] = json!(format!("{root}?$skip={end}")); }
+                    value
+                } else if let Some(id) = uri.path().strip_prefix(&format!("{root}/")) {
+                    json!({"Name":format!("Sensor-{id}"),"ReadingType":"Temperature","ReadingUnits":"Cel","Reading":42,"Status":{"Health":"OK"}})
+                } else {
+                    json!({"Members":[]})
+                };
+                Json(value)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = Target::mock_profile(&format!("http://{addr}/"), Profile::Asrockrack1u12e);
+        let mut original_sample = None;
+        for (round, cached) in [48, 96, 136].into_iter().enumerate() {
+            paths.lock().unwrap().clear();
+            let result = collect("CPU-02", &target, &Semaphore::new(4)).await;
+            assert!(result.requests <= MAX_REQUESTS_PER_SCRAPE);
+            assert_eq!(result.errors, u32::from(round < 2));
+            let output = metrics::render("CPU-02", result, 0.1);
+            assert!(output.contains("redfish_sensor_inventory_count{target=\"CPU-02\"} 136"));
+            assert!(output.contains(&format!(
+                "redfish_sensor_cached_count{{target=\"CPU-02\"}} {cached}"
+            )));
+            assert_eq!(
+                output
+                    .lines()
+                    .filter(|l| l.starts_with("redfish_sensor_temperature_celsius{"))
+                    .count(),
+                cached
+            );
+            let zero = output
+                .lines()
+                .find(|l| {
+                    l.starts_with("redfish_sensor_temperature_celsius{")
+                        && l.contains("name=\"Sensor-0\"")
+                })
+                .unwrap();
+            assert_eq!(
+                zero.split_whitespace().count(),
+                3,
+                "source timestamps must survive cached replay"
+            );
+            if let Some(original) = &original_sample {
+                assert_eq!(zero, original);
+            } else {
+                original_sample = Some(zero.to_owned());
+            }
+            let requested = paths.lock().unwrap();
+            assert_eq!(
+                requested
+                    .iter()
+                    .filter(|p| p.starts_with("/redfish/v1/Chassis/Self/Sensors/"))
+                    .count(),
+                48.min(136 - round * 48)
+            );
+            assert!(requested
+                .iter()
+                .all(|p| !p.contains("$expand") && !p.contains("HGX")));
+        }
+        task.abort();
     }
 
     #[tokio::test]
