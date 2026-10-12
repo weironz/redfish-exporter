@@ -1,6 +1,7 @@
 //! Bounded 1U12E sensor directory discovery and timestamp-preserving rolling reads.
 //! No expansion, background session, new endpoint, or raised baseline budget.
 use super::{metrics, safe_path, Collection, Metric, Target, MAX_REQUESTS_PER_SCRAPE};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
@@ -17,6 +18,15 @@ pub(super) struct Cache {
     inventory: Vec<String>,
     cursor: usize,
     samples: BTreeMap<String, Snapshot>,
+}
+
+#[cfg(test)]
+impl Cache {
+    pub(super) fn age_by(&mut self, age: Duration) {
+        for snapshot in self.samples.values_mut() {
+            snapshot.observed -= age;
+        }
+    }
 }
 
 struct Snapshot {
@@ -162,6 +172,7 @@ pub(super) async fn collect(
     cache
         .samples
         .retain(|_, snapshot| snapshot.observed.elapsed() < MAX_AGE);
+    let requests_before = out.requests;
     let reads = READS_PER_ROUND
         .min(cache.inventory.len().saturating_sub(cache.cursor))
         .min(MAX_REQUESTS_PER_SCRAPE.saturating_sub(out.requests));
@@ -179,8 +190,24 @@ pub(super) async fn collect(
                     },
                 );
             }
-            Some(_) => {
+            Some(value) => {
                 cache.samples.remove(&path);
+                let name_state = match value.get("Name") {
+                    None => "missing",
+                    Some(Value::Null) => "null",
+                    Some(Value::String(_)) => "empty",
+                    Some(_) => "non_string",
+                };
+                tracing::warn!(
+                    target = name,
+                    sensor_id = &path[root.len() + 1..],
+                    name_state,
+                    object = value.is_object(),
+                    id_present = value["Id"].is_string(),
+                    reading_present = !value["Reading"].is_null(),
+                    health_present = value["Status"]["Health"].is_string(),
+                    "sensor detail has no usable name"
+                );
                 incomplete(out);
             }
             None => {
@@ -201,6 +228,15 @@ pub(super) async fn collect(
     if cache.samples.len() != cache.inventory.len() {
         incomplete(out);
     }
+    tracing::info!(
+        target = name,
+        inventory = cache.inventory.len(),
+        cached = cache.samples.len(),
+        requests_before,
+        read_budget = reads,
+        requests_after = out.requests,
+        "bounded sensor read budget"
+    );
 }
 
 #[cfg(test)]
