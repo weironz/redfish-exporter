@@ -652,6 +652,64 @@ pub fn sensor_coverage(out: &mut Vec<Metric>, inventory: usize, cached: usize) {
     }
 }
 
+/// Successfully read details can contain unusable data. Keep this separate
+/// from valid snapshots and operator-declared expected hardware counts.
+pub fn sensor_detail_coverage(
+    out: &mut Vec<Metric>,
+    inventory: usize,
+    valid: usize,
+    invalid: usize,
+) {
+    for (name, value) in [
+        ("redfish_sensor_detail_count", (valid + invalid) as f64),
+        ("redfish_sensor_invalid_count", invalid as f64),
+        (
+            "redfish_sensor_detail_complete",
+            f64::from(valid + invalid == inventory),
+        ),
+    ] {
+        add(out, name, vec![], value);
+    }
+}
+
+/// No raw body, Name or invented sensor value/health. Replays preserve the
+/// timestamp of the actual HTTP detail response, not this scrape's time.
+pub fn sensor_invalid_observation(
+    value: &Value,
+    id: &str,
+    reason: &'static str,
+    observed: f64,
+) -> Vec<Metric> {
+    let mut out = Vec::new();
+    let labels = vec![("sensor_id", id.to_owned()), ("reason", reason.to_owned())];
+    add(&mut out, "redfish_sensor_invalid_info", labels.clone(), 1.);
+    add(
+        &mut out,
+        "redfish_sensor_detail_last_read_timestamp_seconds",
+        labels.clone(),
+        observed,
+    );
+    for (field, present) in [
+        ("object", value.is_object()),
+        ("id", value["Id"].is_string()),
+        ("reading", !value["Reading"].is_null()),
+        ("health", value["Status"]["Health"].is_string()),
+    ] {
+        let mut field_labels = labels.clone();
+        field_labels.push(("field", field.to_owned()));
+        add(
+            &mut out,
+            "redfish_sensor_invalid_field_present",
+            field_labels,
+            f64::from(present),
+        );
+    }
+    for sample in &mut out {
+        sample.source_ms = Some((observed * 1000.) as u64);
+    }
+    out
+}
+
 pub fn pcie(out: &mut Vec<Metric>, value: &Value) {
     if let Some(n) = number(&value["Members@odata.count"]) {
         add(out, "redfish_pcie_device_count", vec![], n);

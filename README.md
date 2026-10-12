@@ -19,7 +19,7 @@ No new IDC inbound firewall port is required. This exporter never requires tenan
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-docker build -t redfish-exporter:v0.2.5 .
+docker build -t redfish-exporter:v0.2.6 .
 ```
 
 The container image is built locally; this repository does not automatically publish or deploy it. NeoStor's optional Compose `redfish` profile can reference a version-pinned image from an approved registry or a locally loaded image.
@@ -63,7 +63,7 @@ The new development endpoint `/capabilities?target=B300-01` returns the versione
 - Hardware metrics include system power/health, CPU, DIMM, NVMe, NIC, fan, physical temperature, PCIe, HGX board/power, GPU temperature/power and ECC/row-remap counters. The exporter filters AMI `TEMP_CPU`, `FSC`, `Tlimit`, and `Tcontrol` pseudo-temperature fields.
 - Redfish does not reliably expose GPU utilization, processes, Xid, NVLink/NVSwitch bandwidth, or IB fabric congestion. These must remain unavailable unless an authorized additional source supplies them; absence does not mean healthy or zero.
 
-## Bounded 1U12E sensor snapshots and inventory scheduling (v0.2.5 candidate)
+## Bounded 1U12E sensor snapshots and inventory scheduling (v0.2.5)
 
 The ReadyIDC v0.2.3 canary returned 136 Sensors with 50 links on the first page; the former 64-member, non-paginated reader truthfully reported partial. v0.2.4 safely discovers the paginated directory but its live sensor details were starved by baseline resource reads (27,54,78 cached in the first three rounds), so the production center rollout was stopped. The adapter discovers at most 8 pages / 256 unique members, validates total counts and rejects duplicate references, non-numeric pagination, resource/origin changes and `$expand`. v0.2.5 schedules the bounded sensor batch before CPU/member enumeration, then uses only the remaining original 96-request budget for rolling CPU/memory/NIC details. A full offline fixture with 8 processor, 64 memory, 24 NIC and 136 sensor entries converges in three rounds and remains complete across eighteen simulated 600s rounds. This is not a guarantee for every resource size, latency or firmware response; the live source/coverage gate still must pass.
 
@@ -73,6 +73,14 @@ The rolling inventory applies **only to 1U12E**. Every advertised collection is 
 
 This does not enable OS access, create a background sensor collector, relax control authorization or fix missing NVMe inventory. Keep `honor_timestamps: true` (the Prometheus/vmagent default) and use coverage plus source age for dashboards/alerts. Detailed safety and acceptance evidence is in [the bounded sensor report](docs/1u12e-bounded-sensors-2026-10-12.md).
 
-Offline tests use a mock BMC only. Live canary collection and IDC/production deployment require separate authorization and coordination with the existing collector. v0.2.5 is a source candidate, not yet a deployed image. Logs expose bounded collection coverage/read budgets and response-shape diagnostics for missing sensor names, never raw bodies or credentials. A missing/invalid sensor name still remains partial; no invented reading, health or count bypass is used to pass the gate.
+Offline tests use a mock BMC only. Live canary collection and IDC/production deployment require separate authorization and coordination with the existing collector. The separately authorized ReadyIDC v0.2.5 deployment on 2026-10-12 exposed three empty sensor details (207, 232, 233) in the 136-member directory. Its acceptance gate failed: center deployment was not permitted. Logs expose bounded collection coverage/read budgets and response-shape diagnostics for missing sensor names, never raw bodies or credentials. A missing/invalid sensor name still remains partial; no invented reading, health or count bypass is used to pass the gate.
+
+## Invalid sensor detail diagnostics (v0.2.6 source candidate, not deployed)
+
+The 1U12E adapter keeps the directory size unchanged. `redfish_sensor_cached_count` still counts usable named sensor snapshots, and `redfish_sensor_snapshot_complete` still requires every directory member to be usable. The new `redfish_sensor_detail_count` counts fresh details read successfully, including invalid responses; `redfish_sensor_invalid_count` counts their invalid subset. `redfish_sensor_detail_complete=1` means all details have been read, **not** that readings or hardware are healthy. Invalid responses continue to mark the power group and scrape partial, including cache-replay rounds.
+
+Each invalid response emits `redfish_sensor_invalid_info{sensor_id,reason}`, `redfish_sensor_detail_last_read_timestamp_seconds`, and `redfish_sensor_invalid_field_present{field}`. Reasons are fixed codes (`name_missing`, `name_null`, `name_empty`, `name_non_string`), not raw response text. Field-presence flags describe object/Id/Reading/Health availability, not hardware values. All diagnostic samples retain the actual detail-read timestamp. The same 1800s expiry, directory invalidation, failed-read eviction, 48-detail and 96-total request budgets apply. No new BMC requests or background worker are added.
+
+The mock regression with three empty details yields valid coverage 48/93/133/133 and read coverage 48/96/136/136 across four simulated rounds; usable coverage remains incomplete. These are offline fixture results, not additional live readings. Firmware placeholders, uninstalled sensors or mapping faults remain unconfirmed. An operator-approved diagnostic-aware gate is required before another deployment; these changes do not turn the failed v0.2.5 gate into a pass. NeoStor's next source candidate exposes the diagnostics and keeps asset coverage separate from collector coverage.
 
 The first authorized one-host-per-model canary results are recorded in [the validation report](docs/live-validation-2026-09-28.md). On 2026-10-12 ReadyIDC was authorized to upgrade only the original three canaries to exporter v0.2.4 / NeoStor Agent v0.0.23. CPU-Server-02 remains partial, so center remains v0.0.21. Datazone v0.2.3 was pulled for offline version smoke only. Recheck live versions before another deployment. These observations do not establish full-fleet or rendered Web acceptance.

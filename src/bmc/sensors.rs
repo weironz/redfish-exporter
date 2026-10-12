@@ -18,12 +18,16 @@ pub(super) struct Cache {
     inventory: Vec<String>,
     cursor: usize,
     samples: BTreeMap<String, Snapshot>,
+    invalid: BTreeMap<String, Snapshot>,
 }
 
 #[cfg(test)]
 impl Cache {
     pub(super) fn age_by(&mut self, age: Duration) {
         for snapshot in self.samples.values_mut() {
+            snapshot.observed -= age;
+        }
+        for snapshot in self.invalid.values_mut() {
             snapshot.observed -= age;
         }
     }
@@ -168,6 +172,7 @@ pub(super) async fn collect(
         cache.inventory = inventory;
         cache.cursor = 0;
         cache.samples.clear();
+        cache.invalid.clear();
     }
     cache
         .samples
@@ -180,8 +185,13 @@ pub(super) async fn collect(
         let path = cache.inventory[cache.cursor].clone();
         cache.cursor = (cache.cursor + 1) % cache.inventory.len();
         match out.fetch(name, target, inflight, &path).await {
-            Some(value) if value["Name"].as_str().is_some_and(|name| !name.is_empty()) => {
+            Some(value)
+                if value["Name"]
+                    .as_str()
+                    .is_some_and(|name| !name.trim().is_empty()) =>
+            {
                 let id = &path[root.len() + 1..];
+                cache.invalid.remove(&path);
                 cache.samples.insert(
                     path.clone(),
                     Snapshot {
@@ -192,12 +202,24 @@ pub(super) async fn collect(
             }
             Some(value) => {
                 cache.samples.remove(&path);
-                let name_state = match value.get("Name") {
-                    None => "missing",
-                    Some(Value::Null) => "null",
-                    Some(Value::String(_)) => "empty",
-                    Some(_) => "non_string",
+                let (name_state, reason) = match value.get("Name") {
+                    None => ("missing", "name_missing"),
+                    Some(Value::Null) => ("null", "name_null"),
+                    Some(Value::String(_)) => ("empty", "name_empty"),
+                    Some(_) => ("non_string", "name_non_string"),
                 };
+                cache.invalid.insert(
+                    path.clone(),
+                    Snapshot {
+                        observed: Instant::now(),
+                        samples: metrics::sensor_invalid_observation(
+                            &value,
+                            &path[root.len() + 1..],
+                            reason,
+                            metrics::epoch(),
+                        ),
+                    },
+                );
                 tracing::warn!(
                     target = name,
                     sensor_id = &path[root.len() + 1..],
@@ -208,10 +230,10 @@ pub(super) async fn collect(
                     health_present = value["Status"]["Health"].is_string(),
                     "sensor detail has no usable name"
                 );
-                incomplete(out);
             }
             None => {
                 cache.samples.remove(&path);
+                cache.invalid.remove(&path);
             }
         }
         if out.blocked {
@@ -221,9 +243,29 @@ pub(super) async fn collect(
     cache
         .samples
         .retain(|_, snapshot| snapshot.observed.elapsed() < MAX_AGE);
+    cache
+        .invalid
+        .retain(|_, snapshot| snapshot.observed.elapsed() < MAX_AGE);
     metrics::sensor_coverage(&mut out.samples, cache.inventory.len(), cache.samples.len());
+    metrics::sensor_detail_coverage(
+        &mut out.samples,
+        cache.inventory.len(),
+        cache.samples.len(),
+        cache.invalid.len(),
+    );
     for snapshot in cache.samples.values() {
         out.samples.extend(snapshot.samples.iter().cloned());
+    }
+    for snapshot in cache.invalid.values() {
+        out.samples.extend(snapshot.samples.iter().cloned());
+    }
+    // Invalid resource evidence remains an error while fresh, including rounds
+    // that replay it rather than read that member. Read completeness is not
+    // usable coverage and must never promote the power group to healthy.
+    if !cache.invalid.is_empty() {
+        out.failed_groups.insert("power");
+        // Directory validation caps this map at MAX_SENSORS (256).
+        out.errors = out.errors.saturating_add(cache.invalid.len() as u32);
     }
     if cache.samples.len() != cache.inventory.len() {
         incomplete(out);
@@ -232,6 +274,7 @@ pub(super) async fn collect(
         target = name,
         inventory = cache.inventory.len(),
         cached = cache.samples.len(),
+        invalid = cache.invalid.len(),
         requests_before,
         read_budget = reads,
         requests_after = out.requests,
@@ -312,6 +355,204 @@ mod tests {
         out.up = true;
         out.errors = 0;
         out
+    }
+
+    // Reproduce the live response shape without altering directory size or
+    // promoting successful HTTP reads to usable sensor observations.
+    #[tokio::test]
+    async fn empty_details_remain_diagnosed_partial_across_natural_rounds() {
+        let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let captured = seen.clone();
+        let app = Router::new().fallback(get(move |uri: Uri| {
+            captured.lock().unwrap().push(uri.to_string());
+            async move {
+                if uri.path() == ROOT {
+                    let paths = (0..133).filter(|id| *id != 99).map(|id| id.to_string())
+                        .chain(["200", "207", "232", "233"].map(str::to_owned))
+                        .map(|id| format!("{ROOT}/{id}")).collect::<BTreeSet<_>>()
+                        .into_iter().collect::<Vec<_>>();
+                    let skip = uri.query().and_then(|q| q.strip_prefix("$skip="))
+                        .and_then(|q| q.parse::<usize>().ok()).unwrap_or(0);
+                    let end = (skip + 50).min(paths.len());
+                    let mut page = json!({"Members@odata.count":136,"Members":paths[skip..end].iter().map(|p|json!({"@odata.id":p})).collect::<Vec<_>>()});
+                    if end < paths.len() {
+                        page["Members@odata.nextLink"] = json!(format!("{ROOT}?$skip={end}"));
+                    }
+                    return Json(page);
+                }
+                let id = uri.path().rsplit('/').next().unwrap();
+                if ["207", "232", "233"].contains(&id) {
+                    return Json(json!({"Id":id,"Name":""}));
+                }
+                Json(json!({"Name":"same display name","Reading":42,"ReadingType":"Temperature","ReadingUnits":"Cel","Status":{"Health":"OK"}}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = Target::mock_profile(
+            &format!("http://{addr}/"),
+            super::super::Profile::Asrockrack1u12e,
+        );
+        let mut first_diagnostic = None;
+        for round in 0..4 {
+            if round > 0 {
+                target.sensors.lock().await.age_by(Duration::from_secs(600));
+            }
+            seen.lock().unwrap().clear();
+            let mut out = collection();
+            collect("fixture", &target, &Semaphore::new(1), &mut out, ROOT).await;
+            assert!(out.requests <= MAX_REQUESTS_PER_SCRAPE);
+            assert!(seen.lock().unwrap().len() <= 51);
+            if round >= 1 {
+                assert!(out.failed_groups.contains("power"));
+                assert!(out.errors > 0);
+            }
+            let text = metrics::render("fixture", out, 0.1);
+            let valid = [48, 93, 133, 133][round];
+            let read = [48, 96, 136, 136][round];
+            let invalid = if round == 0 { 0 } else { 3 };
+            for (metric, count) in [
+                ("redfish_sensor_inventory_count", 136),
+                ("redfish_sensor_cached_count", valid),
+                ("redfish_sensor_detail_count", read),
+                ("redfish_sensor_invalid_count", invalid),
+            ] {
+                assert!(
+                    text.contains(&format!("{metric}{{target=\"fixture\"}} {count}")),
+                    "round {round}: missing {metric}={count}"
+                );
+            }
+            assert!(text.contains("redfish_sensor_snapshot_complete{target=\"fixture\"} 0"));
+            assert!(text.contains(&format!(
+                "redfish_sensor_detail_complete{{target=\"fixture\"}} {}",
+                usize::from(round >= 2)
+            )));
+            if round >= 1 {
+                let diagnostic = text
+                    .lines()
+                    .find(|line| {
+                        line.starts_with("redfish_sensor_invalid_info{")
+                            && line.contains("sensor_id=\"207\"")
+                    })
+                    .unwrap();
+                assert!(diagnostic.contains("reason=\"name_empty\""));
+                assert!(!text.lines().any(|line| line
+                    .starts_with("redfish_sensor_temperature_celsius{")
+                    && line.contains("sensor_id=\"207\"")));
+                if round == 1 {
+                    first_diagnostic = Some(diagnostic.to_owned());
+                } else {
+                    assert_eq!(
+                        Some(diagnostic),
+                        first_diagnostic.as_deref(),
+                        "cache replay must retain diagnostic source time"
+                    );
+                }
+            }
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_detail_diagnostics_expire_recover_and_invalidate_with_directory() {
+        let response = Arc::new(StdMutex::new(json!({"Id":"207","Name":""})));
+        let removed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let current = response.clone();
+        let absent = removed.clone();
+        let failing = fail_read.clone();
+        let app = Router::new().fallback(get(move |uri: Uri| {
+            let value = current.lock().unwrap().clone();
+            let empty = absent.load(std::sync::atomic::Ordering::SeqCst);
+            let failed = failing.load(std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if uri.path() != ROOT && failed {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                Json(if uri.path() == ROOT {
+                    if empty { json!({"Members":[],"Members@odata.count":0}) }
+                    else { json!({"Members":[{"@odata.id":format!("{ROOT}/207")}],"Members@odata.count":1}) }
+                } else { value }).into_response()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = Target::mock_profile(
+            &format!("http://{addr}/"),
+            super::super::Profile::Asrockrack1u12e,
+        );
+        for (value, reason) in [
+            (json!({"Id":"207"}), "name_missing"),
+            (json!({"Name":null}), "name_null"),
+            (json!({"Name":" \t "}), "name_empty"),
+            (
+                json!({"Name":{"private":"do-not-export"},"Password":"do-not-export"}),
+                "name_non_string",
+            ),
+            (json!("do-not-export"), "name_missing"),
+        ] {
+            *response.lock().unwrap() = value;
+            let mut out = collection();
+            collect("fixture", &target, &Semaphore::new(1), &mut out, ROOT).await;
+            let text = metrics::render("fixture", out, 0.1);
+            assert!(text.contains(&format!("reason=\"{reason}\"")));
+            assert!(!text.contains("do-not-export"));
+            assert!(text.contains("redfish_sensor_cached_count{target=\"fixture\"} 0"));
+            assert!(text.contains("redfish_sensor_detail_complete{target=\"fixture\"} 1"));
+            assert!(text.contains("redfish_scrape_complete{target=\"fixture\"} 0"));
+        }
+        target.sensors.lock().await.age_by(MAX_AGE);
+        let mut expired = collection();
+        expired.requests = MAX_REQUESTS_PER_SCRAPE - 1; // Directory only, no detail refresh.
+        collect("fixture", &target, &Semaphore::new(1), &mut expired, ROOT).await;
+        let text = metrics::render("fixture", expired, 0.1);
+        assert!(!text.contains("redfish_sensor_invalid_info"));
+        assert!(text.contains("redfish_sensor_detail_count{target=\"fixture\"} 0"));
+        assert!(text.contains("redfish_sensor_detail_complete{target=\"fixture\"} 0"));
+        *response.lock().unwrap() = json!({"Name":"real-name","Status":{"Health":"OK"}});
+        let mut recovered = collection();
+        collect("fixture", &target, &Semaphore::new(1), &mut recovered, ROOT).await;
+        let text = metrics::render("fixture", recovered, 0.1);
+        assert!(!text.contains("redfish_sensor_invalid_info"));
+        assert!(text.contains("redfish_sensor_invalid_count{target=\"fixture\"} 0"));
+        assert!(text.contains("redfish_sensor_snapshot_complete{target=\"fixture\"} 1"));
+        *response.lock().unwrap() = json!({"Name":""});
+        let mut failed = collection();
+        collect("fixture", &target, &Semaphore::new(1), &mut failed, ROOT).await;
+        assert_eq!(target.sensors.lock().await.invalid.len(), 1);
+        fail_read.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut failed_get = collection();
+        collect(
+            "fixture",
+            &target,
+            &Semaphore::new(1),
+            &mut failed_get,
+            ROOT,
+        )
+        .await;
+        assert!(target.sensors.lock().await.invalid.is_empty());
+        assert!(
+            !metrics::render("fixture", failed_get, 0.1).contains("redfish_sensor_invalid_info")
+        );
+        fail_read.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut invalid_again = collection();
+        collect(
+            "fixture",
+            &target,
+            &Semaphore::new(1),
+            &mut invalid_again,
+            ROOT,
+        )
+        .await;
+        assert_eq!(target.sensors.lock().await.invalid.len(), 1);
+        removed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut changed = collection();
+        collect("fixture", &target, &Semaphore::new(1), &mut changed, ROOT).await;
+        assert!(target.sensors.lock().await.invalid.is_empty());
+        assert!(!metrics::render("fixture", changed, 0.1).contains("redfish_sensor_invalid_info"));
+        task.abort();
     }
 
     #[tokio::test]
