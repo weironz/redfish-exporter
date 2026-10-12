@@ -366,6 +366,46 @@ mod tests {
         task.abort();
     }
 
+    // Diagnostic reproduction of the v0.2.4 live canary: this deliberately
+    // asserts truthful partial coverage, not successful fleet acceptance.
+    #[tokio::test]
+    async fn constrained_sensor_budget_cannot_converge_before_cache_expiry() {
+        let inventory = (0..136)
+            .map(|i| json!({"@odata.id":format!("{ROOT}/{i}")}))
+            .collect::<Vec<_>>();
+        let (target, seen, task) = mock(
+            json!({"Members@odata.count":136,"Members":inventory}),
+            false,
+        )
+        .await;
+        let mut maximum_cached = 0;
+        for round in 0..12 {
+            if round > 0 {
+                // Advance observation age only: no sleep and no live BMC.
+                for snapshot in target.sensors.lock().await.samples.values_mut() {
+                    snapshot.observed -= Duration::from_secs(600);
+                }
+            }
+            seen.lock().unwrap().clear();
+            let mut out = collection();
+            // A single directory GET consumes the 69th request, leaving 27.
+            // This models the observed remaining budget, not its device-level
+            // breakdown (which is not currently exposed in live telemetry).
+            out.requests = 68;
+            collect("fixture", &target, &Semaphore::new(1), &mut out, ROOT).await;
+            assert!(out.requests <= MAX_REQUESTS_PER_SCRAPE);
+            assert!(seen.lock().unwrap().len() <= 28);
+            let cached = target.sensors.lock().await.samples.len();
+            maximum_cached = maximum_cached.max(cached);
+            assert!(cached <= 81);
+            assert!(out.failed_groups.contains("power"));
+            let text = metrics::render("fixture", out, 0.1);
+            assert!(text.contains("redfish_sensor_snapshot_complete{target=\"fixture\"} 0"));
+        }
+        assert_eq!(maximum_cached, 81);
+        task.abort();
+    }
+
     #[tokio::test]
     async fn inventory_change_invalidates_old_values_and_403_stops_this_and_next_round() {
         for fail in [false, true] {
