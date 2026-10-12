@@ -80,3 +80,37 @@ v0.2.5 固定源码 `868a3a5da595dd3b76e22c7cd25422334869936c` 已经独立获�
 NeoStor 新源码候选将这些诊断接到固定指标API与Web，并按资产主档计入未接入
 设备。任何下一轮 IDC 变更仍需单独批准，固定新版本/源码/digest，不覆盖v0.2.5。
 空资源含义、CPU-02 NVMe及PowerSupplies物理计数仍须独立判定。
+
+## 2026-10-13 电源条目与磁盘协议诊断补齐（仍为未部署候选）
+
+CPU-02 现生产 Web 的 PowerSupplies 22 个条目含 CPU/DDR5 功耗域，不能由数组
+长度推断 22 个物理 PSU。候选 v0.2.6 不再从该数组生成 redfish_psu_*；改为
+redfish_sensor_power_supply_entry_count/info/health/output_watts，保留有界 Name、
+MemberId 及 entry_index。数组索引只用于区分当次条目，不是物理槽位或稳定身份。
+缺失状态不补正常，明确数值 0 保留，不累加可能重叠的功耗域；数组非对象或超过
+64 项使 power 组不完整。原 PowerControl 的整机功耗独立保留。
+
+CPU-02 的现生产页面已有 8 个名称为 NVMe 的资源和 4 个 SCSI 资源的逐盘健康，
+前 8 项容量各 7,681,501,126,656 字节；其汇总 NVMe 指标仍缺失。历史本机
+canary .prom 文件也已有这些条目。本轮只读已有文件 / Web，没有直接访问 BMC。
+源码确认原汇总要求所有 Drive.Protocol 都为字符串；任一缺失会省略汇总，空
+字符串却会被当非 NVMe。实机究竟哪个字段缺失或歧义仍不能仅靠 .prom 证明。
+
+候选用同一批已读取 Drive 响应输出四项 redfish_drive_* 诊断：完整读取的资源
+数、明确 Protocol=NVMe 的条目数、按 protocol_state 的数量和逐盘协议信息。
+missing/empty/invalid_type/ambiguous/unsupported 不生成完整 NVMe 总数；PCIe、
+OEM、MultiProtocol 不凭名称推断 NVMe。recognized 协议范围在代码里明确，其他
+值保留 unsupported 诊断，不泄漏任意响应正文。协议不全使 drives 组不完整，
+但仍保留有效逐盘健康 / 容量。重复链接在取详情前拒绝；不新增请求，保留 16
+个磁盘详情 / 96 整轮预算。所有详情未读齐时不生成观察总数。
+
+依据：[DMTF Drive schema](https://redfish.dmtf.org/schemas/v1/Drive.v1_22_0.json)
+与 [Protocol schema](https://redfish.dmtf.org/schemas/v1/Protocol.json)。Protocol
+描述实际通信协议，允许 null；PCIe 与 NVMe 是不同枚举，不能互相推断。这里的
+资源条目数、明确 NVMe 条目数均不是独立核验的物理库存或硬件健康。
+
+本地 52 tests passed / 0 failed / 0 ignored，严格 Clippy / fmt 通过；先复现
+缺少诊断、空协议误报零和重复链接误计数，再修复。三个 CPU profile 的本机
+HTTP 集成测试验证缺失协议仍 partial、保留逐盘值、重复链接不发详情请求。
+未测代码覆盖率（本机未安装 cargo-llvm-cov）。固定提交 CI、新镜像及自然实机
+灰度还需另验；原 v0.2.5 失败门禁不恢复，不沿用旧批准发布中心。

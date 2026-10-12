@@ -159,21 +159,67 @@ pub fn memory(out: &mut Vec<Metric>, value: &Value) {
     }
 }
 
-pub fn nvme_count(out: &mut Vec<Metric>, drives: &[Value]) {
-    if drives
+// Drive.Protocol is nullable. PCIe/OEM/MultiProtocol do not prove whether the
+// device speaks NVMe. Never classify using a Name, serial or controller capability.
+fn drive_protocol(value: &Value) -> (&'static str, Option<&str>) {
+    match value.get("Protocol") {
+        None | Some(Value::Null) => ("missing", None),
+        Some(Value::String(p)) if p.trim().is_empty() => ("empty", None),
+        Some(Value::String(p)) => match p.as_str() {
+            "NVMe" | "SATA" | "SAS" | "AHCI" | "USB" | "FC" | "iSCSI" | "FCoE" | "FCP"
+            | "FICON" | "NVMeOverFabrics" | "eMMC" => ("recognized", Some(p)),
+            "PCIe" | "OEM" | "MultiProtocol" => ("ambiguous", Some(p)),
+            _ => ("unsupported", None),
+        },
+        Some(_) => ("invalid_type", None),
+    }
+}
+
+/// Counts only fully fetched, bounded resource inventories. Observed resources
+/// and confirmed NVMe entries are not a claim about complete physical inventory.
+pub fn nvme_count(out: &mut Vec<Metric>, drives: &[Value]) -> bool {
+    if drives.len() > 16 || drives.iter().any(|d| !d.is_object()) {
+        return false;
+    }
+    add(
+        out,
+        "redfish_drive_inventory_observed_count",
+        vec![],
+        drives.len() as f64,
+    );
+    let nvme = drives
         .iter()
-        .all(|drive| drive["Protocol"].as_str().is_some())
-    {
+        .filter(|d| drive_protocol(d).1 == Some("NVMe"))
+        .count();
+    add(
+        out,
+        "redfish_drive_nvme_observed_count",
+        vec![],
+        nvme as f64,
+    );
+    for state in [
+        "recognized",
+        "missing",
+        "empty",
+        "invalid_type",
+        "ambiguous",
+        "unsupported",
+    ] {
         add(
             out,
-            "redfish_nvme_drive_count",
-            vec![],
+            "redfish_drive_protocol_observed_count",
+            vec![("protocol_state", state.into())],
             drives
                 .iter()
-                .filter(|drive| drive["Protocol"] == "NVMe")
+                .filter(|d| drive_protocol(d).0 == state)
                 .count() as f64,
         );
     }
+    let classified = drives.iter().all(|d| drive_protocol(d).0 == "recognized");
+    if classified {
+        add(out, "redfish_nvme_drive_count", vec![], nvme as f64);
+    }
+    classified
 }
 
 /// B300 inventory is complete only when both expanded collections agree on every NVMe unit.
@@ -296,10 +342,23 @@ pub fn b300_nvme_inventory(out: &mut Vec<Metric>, storage: &Value, simple: &Valu
 }
 
 pub fn drive(out: &mut Vec<Metric>, value: &Value) {
+    if !value.is_object() {
+        return;
+    }
     let labels = vec![
         ("name", string(&value["Name"])),
         ("serial", string(&value["SerialNumber"])),
     ];
+    let (state, protocol) = drive_protocol(value);
+    let mut info_labels = labels.clone();
+    info_labels.push(("protocol_state", state.into()));
+    if let Some(protocol) = protocol {
+        info_labels.push(("protocol", protocol.into()));
+    }
+    if value["Id"].as_str().is_some_and(|id| !id.trim().is_empty()) {
+        info_labels.push(("resource_id", string(&value["Id"])));
+    }
+    add(out, "redfish_drive_protocol_info", info_labels, 1.);
     add(
         out,
         "redfish_drive_health",
@@ -556,7 +615,11 @@ pub fn thermal(out: &mut Vec<Metric>, value: &Value) {
     }
 }
 
-pub fn power(out: &mut Vec<Metric>, value: &Value) {
+/// PowerSupplies on some AMI models contains CPU/DIMM power domains rather
+/// than identifiable physical PSUs. Export collection entries, never infer
+/// physical inventory or sum overlapping domains into chassis consumption.
+/// False means an advertised array is malformed/oversized, not unsupported.
+pub fn power(out: &mut Vec<Metric>, value: &Value) -> bool {
     if let Some(controls) = value["PowerControl"].as_array() {
         if controls.len() == 1 {
             if let Some(watts) = number(&controls[0]["PowerConsumedWatts"]) {
@@ -564,28 +627,54 @@ pub fn power(out: &mut Vec<Metric>, value: &Value) {
             }
         }
     }
-    if let Some(supplies) = value["PowerSupplies"].as_array() {
-        add(out, "redfish_psu_count", vec![], supplies.len() as f64);
-        for (index, supply) in supplies.iter().enumerate() {
-            let name = supply["Name"]
-                .as_str()
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("PSU-{index}"));
-            let labels = vec![("name", name)];
-            if !supply["Status"]["Health"].is_null() {
-                add(
-                    out,
-                    "redfish_psu_health",
-                    labels.clone(),
-                    health(&supply["Status"]["Health"]),
-                );
-            }
-            if let Some(watts) = number(&supply["PowerOutputWatts"]) {
-                add(out, "redfish_psu_output_watts", labels, watts);
+    let supplies = match value.get("PowerSupplies") {
+        None | Some(Value::Null) => return true,
+        Some(Value::Array(entries))
+            if entries.len() <= 64 && entries.iter().all(Value::is_object) =>
+        {
+            entries
+        }
+        _ => return false,
+    };
+    add(
+        out,
+        "redfish_sensor_power_supply_entry_count",
+        vec![],
+        supplies.len() as f64,
+    );
+    for (index, supply) in supplies.iter().enumerate() {
+        // Array index is only an observation-local discriminator, not a slot
+        // or persistent physical identity. Preserve the BMC MemberId when given.
+        let mut labels = vec![("entry_index", index.to_string())];
+        for (key, label) in [("Name", "name"), ("MemberId", "member_id")] {
+            if supply[key].as_str().is_some_and(|s| !s.trim().is_empty()) {
+                labels.push((label, string(&supply[key])));
             }
         }
+        add(
+            out,
+            "redfish_sensor_power_supply_entry_info",
+            labels.clone(),
+            1.,
+        );
+        if supply["Status"]["Health"].is_string() {
+            add(
+                out,
+                "redfish_sensor_power_supply_entry_health",
+                labels.clone(),
+                health(&supply["Status"]["Health"]),
+            );
+        }
+        if let Some(watts) = number(&supply["PowerOutputWatts"]) {
+            add(
+                out,
+                "redfish_sensor_power_supply_entry_output_watts",
+                labels,
+                watts,
+            );
+        }
     }
+    true
 }
 
 pub fn sensor(out: &mut Vec<Metric>, value: &Value) {
@@ -1130,6 +1219,75 @@ mod tests {
     }
 
     #[test]
+    fn power_supply_entries_are_observations_not_physical_psu_inventory() {
+        let entries: Vec<_> = (0..22).map(|i| json!({"MemberId":i.to_string(),"Name":"CPU/DDR5 Power","PowerOutputWatts":if i == 0 {0}else{10},"Status":{"Health":"OK"}})).collect();
+        let mut samples = vec![];
+        power(&mut samples, &json!({"PowerSupplies":entries}));
+        assert!(!samples.iter().any(|m| m.name.starts_with("redfish_psu_")));
+        assert_eq!(
+            samples
+                .iter()
+                .find(|m| m.name == "redfish_sensor_power_supply_entry_count")
+                .map(|m| m.value),
+            Some(22.)
+        );
+        let watts: Vec<_> = samples
+            .iter()
+            .filter(|m| m.name == "redfish_sensor_power_supply_entry_output_watts")
+            .collect();
+        assert_eq!(watts.len(), 22);
+        assert_eq!(watts[0].value, 0.);
+        assert!(watts
+            .iter()
+            .enumerate()
+            .all(|(i, m)| m.labels.contains(&("entry_index", i.to_string()))
+                && m.labels.contains(&("member_id", i.to_string()))));
+        assert!(!samples
+            .iter()
+            .any(|m| m.name == "redfish_chassis_power_watts")); // No sum of possibly overlapping domains.
+        let mut anonymous = vec![];
+        power(
+            &mut anonymous,
+            &json!({"PowerSupplies":[{}, {"Name":"same"}, {"Name":"same","Status":{"Health":"Unrecognized"}}]}),
+        );
+        assert!(!anonymous.iter().any(|m| m
+            .labels
+            .iter()
+            .any(|(k, v)| *k == "name" && v.starts_with("PSU-"))));
+        assert!(!anonymous.iter().any(|m| m.name.ends_with("output_watts")));
+        assert_eq!(
+            anonymous
+                .iter()
+                .filter(|m| m.name == "redfish_sensor_power_supply_entry_health")
+                .map(|m| m.value)
+                .collect::<Vec<_>>(),
+            vec![3.]
+        );
+    }
+
+    #[test]
+    fn malformed_or_oversized_power_arrays_do_not_claim_complete_entry_counts() {
+        for value in [
+            json!({"PowerSupplies":"invalid"}),
+            json!({"PowerSupplies":[{},null]}),
+            json!({"PowerSupplies":vec![json!({});65]}),
+        ] {
+            let mut out = vec![];
+            assert!(!power(&mut out, &value));
+            assert!(out.is_empty());
+        }
+        for value in [json!({}), json!({"PowerSupplies":null})] {
+            let mut out = vec![];
+            assert!(power(&mut out, &value));
+            assert!(out.is_empty());
+        }
+        let mut out = vec![];
+        assert!(power(&mut out, &json!({"PowerSupplies":[]})));
+        assert_eq!(out[0].name, "redfish_sensor_power_supply_entry_count");
+        assert_eq!(out[0].value, 0.); // Observed empty array, not zero physical PSUs.
+    }
+
+    #[test]
     fn cpu_power_and_sensor_units_are_normalized_without_guessing() {
         let mut out = vec![];
         power(
@@ -1168,12 +1326,84 @@ mod tests {
     fn nvme_count_requires_known_protocol_for_every_drive() {
         let mut out = vec![];
         nvme_count(&mut out, &[json!({"Protocol":"NVMe"}), json!({})]);
-        assert!(out.is_empty());
+        assert!(!out.iter().any(|m| m.name == "redfish_nvme_drive_count"));
+        out.clear();
         nvme_count(
             &mut out,
             &[json!({"Protocol":"NVMe"}), json!({"Protocol":"SATA"})],
         );
-        assert_eq!(out[0].value, 1.0);
+        assert_eq!(
+            out.iter()
+                .find(|m| m.name == "redfish_nvme_drive_count")
+                .map(|m| m.value),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn incomplete_drive_protocols_expose_observations_without_guessing_a_total() {
+        let mut drives = (0..8)
+            .map(|i| json!({"Name":format!("disk-{i}"),"Protocol":"NVMe"}))
+            .collect::<Vec<_>>();
+        drives.extend([
+            json!({"Name":"NVMe-by-name-only"}),
+            json!({"Protocol":null}),
+            json!({"Protocol":""}),
+            json!({"Protocol":"PCIe"}),
+        ]);
+        let mut out = vec![];
+        for value in &drives {
+            drive(&mut out, value);
+        }
+        nvme_count(&mut out, &drives);
+        let value = |name| out.iter().find(|m| m.name == name).map(|m| m.value);
+        assert_eq!(value("redfish_drive_inventory_observed_count"), Some(12.));
+        assert_eq!(value("redfish_drive_nvme_observed_count"), Some(8.));
+        assert_eq!(value("redfish_nvme_drive_count"), None);
+        assert_eq!(
+            out.iter()
+                .filter(|m| m.name == "redfish_drive_protocol_info")
+                .count(),
+            12
+        );
+        assert!(out.iter().any(|m| m.name == "redfish_drive_protocol_info"
+            && m.labels.contains(&("name", "NVMe-by-name-only".into()))
+            && m.labels.contains(&("protocol_state", "missing".into()))));
+        assert!(out.iter().any(|m| m.name == "redfish_drive_protocol_info"
+            && m.labels.contains(&("protocol", "PCIe".into()))
+            && m.labels.contains(&("protocol_state", "ambiguous".into()))));
+    }
+
+    #[test]
+    fn invalid_drive_protocols_never_become_a_zero_nvme_inventory() {
+        for protocol in [
+            json!(""),
+            json!(" "),
+            json!("nvme"),
+            json!("Unknown"),
+            json!("OEM"),
+            json!("MultiProtocol"),
+            json!(42),
+            json!(null),
+        ] {
+            let mut out = vec![];
+            nvme_count(&mut out, &[json!({"Name":"NVMe0","Protocol":protocol})]);
+            assert!(!out.iter().any(|m| m.name == "redfish_nvme_drive_count"));
+        }
+        let mut empty = vec![];
+        nvme_count(&mut empty, &[]);
+        assert_eq!(
+            empty
+                .iter()
+                .find(|m| m.name == "redfish_nvme_drive_count")
+                .map(|m| m.value),
+            Some(0.)
+        );
+        for drives in [vec![json!(null)], vec![json!({"Protocol":"NVMe"}); 17]] {
+            let mut invalid = vec![];
+            nvme_count(&mut invalid, &drives);
+            assert!(invalid.is_empty());
+        }
     }
 
     #[test]
