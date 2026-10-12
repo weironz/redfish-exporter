@@ -7,6 +7,7 @@ pub struct Metric {
     name: &'static str,
     labels: Vec<(&'static str, String)>,
     value: f64,
+    source_ms: Option<u64>,
 }
 
 fn add(out: &mut Vec<Metric>, name: &'static str, labels: Vec<(&'static str, String)>, value: f64) {
@@ -15,6 +16,7 @@ fn add(out: &mut Vec<Metric>, name: &'static str, labels: Vec<(&'static str, Str
             name,
             labels,
             value,
+            source_ms: None,
         });
     }
 }
@@ -340,7 +342,8 @@ fn group(name: &str) -> Option<&'static str> {
         Some("gpu")
     } else if name.contains("nic_") {
         Some("network")
-    } else if name.contains("power_")
+    } else if name.starts_with("redfish_sensor_")
+        || name.contains("power_")
         || name.contains("psu_")
         || name.contains("fan_")
         || name.contains("temperature_")
@@ -353,7 +356,7 @@ fn group(name: &str) -> Option<&'static str> {
     }
 }
 
-fn epoch() -> f64 {
+pub(crate) fn epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0., |d| d.as_secs_f64())
@@ -568,6 +571,36 @@ pub fn sensor(out: &mut Vec<Metric>, value: &Value) {
     }
 }
 
+/// A rolling sensor sample keeps its own observation time, never the replay time.
+pub fn sensor_observation(value: &Value, id: &str, observed: f64) -> Vec<Metric> {
+    let mut samples = Vec::new();
+    sensor(&mut samples, value);
+    add(
+        &mut samples,
+        "redfish_sensor_last_success_timestamp_seconds",
+        vec![("name", string(&value["Name"]))],
+        observed,
+    );
+    for sample in &mut samples {
+        sample.labels.push(("sensor_id", id.to_owned()));
+        sample.source_ms = Some((observed * 1000.) as u64);
+    }
+    samples
+}
+
+pub fn sensor_coverage(out: &mut Vec<Metric>, inventory: usize, cached: usize) {
+    for (name, value) in [
+        ("redfish_sensor_inventory_count", inventory as f64),
+        ("redfish_sensor_cached_count", cached as f64),
+        (
+            "redfish_sensor_snapshot_complete",
+            f64::from(cached == inventory),
+        ),
+    ] {
+        add(out, name, vec![], value);
+    }
+}
+
 pub fn pcie(out: &mut Vec<Metric>, value: &Value) {
     if let Some(n) = number(&value["Members@odata.count"]) {
         add(out, "redfish_pcie_device_count", vec![], n);
@@ -744,11 +777,18 @@ pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
             observed,
         );
         if successful {
+            let source = result
+                .samples
+                .iter()
+                .filter(|sample| group(sample.name) == Some(id))
+                .filter_map(|sample| sample.source_ms)
+                .map(|source| source as f64 / 1000.)
+                .fold(observed, f64::min);
             add(
                 &mut result.samples,
                 "redfish_group_last_success_timestamp_seconds",
                 vec![("group", id.into())],
-                observed,
+                source,
             );
         }
     }
@@ -795,7 +835,11 @@ pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
         for (key, value) in metric.labels {
             output.push_str(&format!(",{key}=\"{}\"", escape_label(&value)));
         }
-        output.push_str(&format!("}} {}\n", metric.value));
+        output.push_str(&format!("}} {}", metric.value));
+        if let Some(source) = metric.source_ms {
+            output.push_str(&format!(" {source}"));
+        }
+        output.push('\n');
     }
     output
 }
@@ -804,6 +848,23 @@ pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn rolling_sensor_values_and_group_freshness_use_the_original_observation() {
+        let mut result = Collection::failed();
+        result.up = true;
+        result.errors = 0;
+        result.samples = sensor_observation(
+            &json!({"Name":"CPU Temp","Reading":42,"ReadingType":"Temperature","ReadingUnits":"Cel","Status":{"Health":"OK"}}),
+            "12",
+            1000.25,
+        );
+        sensor_coverage(&mut result.samples, 1, 1);
+        let text = render("fixture", result, 0.1);
+        assert!(text.contains("redfish_sensor_temperature_celsius{target=\"fixture\",name=\"CPU Temp\",sensor_id=\"12\"} 42 1000250"));
+        assert!(text.contains("redfish_sensor_last_success_timestamp_seconds{target=\"fixture\",name=\"CPU Temp\",sensor_id=\"12\"} 1000.25 1000250"));
+        assert!(text.contains("redfish_group_last_success_timestamp_seconds{target=\"fixture\",group=\"power\"} 1000.25\n"));
+        assert!(text.contains("redfish_sensor_snapshot_complete{target=\"fixture\"} 1\n"));
+    }
     #[test]
     fn group_failure_is_independent_and_missing_groups_are_not_successful() {
         let mut result = Collection::failed();
