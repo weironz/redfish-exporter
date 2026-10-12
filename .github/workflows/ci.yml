@@ -21,4 +21,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t redfish-exporter:ci .
+      - name: Build fixed-source image
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: docker build --build-arg GIT_SHA="$SOURCE_SHA" -t redfish-exporter:ci .
+      - name: Verify image without network or credentials
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          test "$(docker image inspect redfish-exporter:ci --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$SOURCE_SHA"
+          test "$(docker image inspect redfish-exporter:ci --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')" = 'https://github.com/weironz/redfish-exporter'
+          ACTUAL=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges redfish-exporter:ci --version)
+          test "$ACTUAL" = "redfish-exporter v$VERSION ($SOURCE_SHA)"
+          printf '%s\n' "$ACTUAL"
+      - name: Export checked image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          mkdir image-artifact
+          docker save redfish-exporter:ci -o image-artifact/redfish-exporter.tar
+          docker image inspect redfish-exporter:ci > image-artifact/image-inspect.json
+          (cd image-artifact && sha256sum redfish-exporter.tar image-inspect.json > SHA256SUMS)
+      - name: Keep image for separately authorized publication
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: redfish-exporter-image-${{ github.sha }}
+          path: image-artifact/
+          if-no-files-found: error
+          retention-days: 7
+  image-ready:
+    runs-on: ubuntu-latest
+    needs: [rust, image]
+    steps:
+      - run: echo 'Rust checks and isolated fixed-source image validation passed; deployment is not automatic.'
