@@ -591,7 +591,12 @@ async fn collect_cpu(
                 .iter()
                 .flat_map(|unit| refs(unit, "Drives", 17))
                 .collect();
-            if complete_links && drive_paths.len() <= 16 {
+            let unique_links = drive_paths
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == drive_paths.len();
+            if complete_links && unique_links && drive_paths.len() <= 16 {
                 let mut drives = Vec::with_capacity(drive_paths.len());
                 for path in &drive_paths {
                     if let Some(drive) = out.fetch(name, target, inflight, path).await {
@@ -599,8 +604,11 @@ async fn collect_cpu(
                         drives.push(drive);
                     }
                 }
-                if drives.len() == drive_paths.len() {
-                    metrics::nvme_count(&mut out.samples, &drives);
+                if drives.len() == drive_paths.len()
+                    && !metrics::nvme_count(&mut out.samples, &drives)
+                {
+                    out.failed_groups.insert("drives");
+                    out.errors = out.errors.saturating_add(1);
                 }
             } else {
                 out.failed_groups.insert("drives");
@@ -661,7 +669,10 @@ async fn collect_cpu_chassis(
         }
         if let Some(path) = out.advertised_link(&chassis, "Power") {
             if let Some(value) = out.fetch(name, target, inflight, &path).await {
-                metrics::power(&mut out.samples, &value);
+                if !metrics::power(&mut out.samples, &value) {
+                    out.failed_groups.insert("power");
+                    out.errors = out.errors.saturating_add(1);
+                }
             }
         }
         if let Some(path) = out.advertised_link(&chassis, "Sensors") {
@@ -1417,6 +1428,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_power_entries_fail_the_power_group_without_inventing_psus() {
+        let app = Router::new().fallback(get(|uri: Uri| async move {
+            Json(match uri.path() {
+                "/redfish/v1/Systems/Self" => json!({"Status":{"Health":"OK"},"PowerState":"On"}),
+                "/redfish/v1/Chassis/Self" => {
+                    json!({"Power":{"@odata.id":"/redfish/v1/Chassis/Self/Power"}})
+                }
+                "/redfish/v1/Chassis/Self/Power" => {
+                    json!({"PowerControl":[{"PowerConsumedWatts":420}],"PowerSupplies":[{},null]})
+                }
+                _ => json!({}),
+            })
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = Target::mock_profile(&format!("http://{addr}/"), Profile::Asrockrack1u12e);
+        let result = collect("fixture", &target, &Semaphore::new(1)).await;
+        assert!(result.up);
+        assert!(result.failed_groups.contains("power"));
+        assert!(result.requests <= MAX_REQUESTS_PER_SCRAPE);
+        let output = metrics::render("fixture", result, 0.1);
+        assert!(output.contains("redfish_scrape_complete{target=\"fixture\"} 0"));
+        assert!(output.contains("redfish_group_success{target=\"fixture\",group=\"power\"} 0"));
+        assert!(!output.contains("redfish_psu_"));
+        assert!(!output.contains("redfish_sensor_power_supply_entry_count"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn cpu_drive_protocol_gaps_and_duplicate_links_never_claim_complete_inventory() {
+        for (profile, duplicate) in [
+            (Profile::TyanB8037, false),
+            (Profile::Asrockrack1u10e, false),
+            (Profile::Asrockrack1u12e, false),
+            (Profile::Asrockrack1u12e, true),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            let app = Router::new().fallback(get(move |uri: Uri| {
+                let seen = seen.clone();
+                async move {
+                    let root = "/redfish/v1/Systems/Self/Storage";
+                    let value = match uri.path() {
+                        "/redfish/v1/Systems/Self" => json!({"Status":{"Health":"OK"},"Storage":{"@odata.id":root}}),
+                        path if path == root => json!({"Members":[{"@odata.id":format!("{root}/0")}]}),
+                        "/redfish/v1/Systems/Self/Storage/0" => json!({"Drives":[{"@odata.id":format!("{root}/0/Drives/0")},{"@odata.id":format!("{root}/0/Drives/{}", if duplicate {0} else {1})}]}),
+                        path if path.contains("/Drives/") => {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            let mut drive = json!({"Id":path.rsplit('/').next().unwrap(),"Name":"NVMe-by-name","Status":{"Health":"OK"},"CapacityBytes":100});
+                            if path.ends_with("/0") {drive["Protocol"] = json!("NVMe");}
+                            drive
+                        }
+                        _ => json!({}),
+                    };
+                    Json(value)
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let target = Target::mock_profile(&format!("http://{addr}/"), profile);
+            let result = collect("fixture", &target, &Semaphore::new(1)).await;
+            assert!(result.up);
+            assert!(result.failed_groups.contains("drives"));
+            assert!(result.requests <= MAX_REQUESTS_PER_SCRAPE);
+            let output = metrics::render("fixture", result, 0.1);
+            assert!(!output.contains("redfish_nvme_drive_count{"));
+            assert!(output.contains("redfish_group_success{target=\"fixture\",group=\"drives\"} 0"));
+            if duplicate {
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert!(!output.contains("redfish_drive_inventory_observed_count"));
+            } else {
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                assert!(
+                    output.contains("redfish_drive_inventory_observed_count{target=\"fixture\"} 2")
+                );
+                assert!(output.contains("redfish_drive_nvme_observed_count{target=\"fixture\"} 1"));
+                assert!(output.contains("protocol_state=\"missing\""));
+                assert!(output.contains("redfish_drive_capacity_bytes"));
+            }
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn cpu_profiles_follow_self_links_without_expand_or_hgx_requests() {
         for (profile, expected_model, has_sensors) in [
             (Profile::TyanB8037, "B8037T73X4-200PE4HR-L", false),
@@ -1470,6 +1567,11 @@ mod tests {
                 has_sensors
             );
             assert_eq!(output.contains("redfish_chassis_power_watts"), has_sensors);
+            assert_eq!(
+                output.contains("redfish_sensor_power_supply_entry_count"),
+                has_sensors
+            );
+            assert!(!output.contains("redfish_psu_"));
             assert_eq!(output.contains("redfish_fan_rpm"), has_sensors);
             let paths = paths.lock().expect("paths");
             assert!(paths

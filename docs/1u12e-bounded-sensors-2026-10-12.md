@@ -53,3 +53,64 @@ CPU-Server-02 首次自然采集时间 `2026-10-12T14:07:36.402Z`：HTTP up=1，
 补充后的本地 `cargo test --locked` 为 37 passed、0 failed、0 ignored；严格 Clippy、fmt 检查通过。此次只修改测试与文档，生产实现、版本号和已发布镜像没有改动。
 
 结论：不能把“分页发现成功”当“三轮全覆盖成功”。中心 v0.0.23 发布必须停止，保持 v0.0.21；NVMe 缺数据、真实 Web 面板仍不能宣称验收通过。后续候选应解决基础资源与传感器的预算调度/新鲜度可达性，补真实资源规模测试和可观测预算，再经新版本固定来源测试及单独部署批准。不得覆盖已发布 v0.2.4 标签，也不得通过增加请求量、延长有效期或伪造源时间来绕过门禁。
+
+## 2026-10-13 v0.2.5 实机失败与 v0.2.6 离线诊断候选
+
+v0.2.5 固定源码 `868a3a5da595dd3b76e22c7cd25422334869936c` 已经独立获准、
+只部署在 ReadyIDC 原三台 600s 灰度；Agent 保持 v0.0.23，中心仍 v0.0.21。
+两次自然观察传感器阶段 requests_before=7/read_budget=48/requests_after=55；
+目录136、有效缓存48→93，源时间与中心原始存储时间一致。第二轮 sensor_id
+207/232/233 均为空 Name、无 Reading/Health，旧实机门禁因此停止，不再寻求
+通过延长等待或将目录缩为133放行中心。这些资源为何为空仍未确认。
+
+新 v0.2.6 **只为源码候选，未发布镜像、未部署**：为已成功读取但 Name 无效的
+详情保存有界诊断快照，区分目录发现数、详情读取数、有效快照数及无效详情数。
+`redfish_sensor_detail_complete=1` 不能取代 `redfish_sensor_snapshot_complete`。
+固定原因码、字段存在性及原始读取时间单独暴露，诊断也受1800s有效期、目录
+失效、失败详情移除约束；不输出原始正文，不给无效项伪造温度、功耗或健康。
+无效快照新鲜期间，即使本轮只重放缓存，power和scrape仍保持不完整。
+请求顺序及48/96预算不变，没有新增工作线程或真实BMC读取。
+
+本地 mock 四轮复现136项目录/三项空详情：有效缓存48/93/133/133，详情读取
+48/96/136/136，无效0/3/3/3，读取齐但有效覆盖仍不完整。诊断重放保留原始
+时间；另覆盖缺失/null/空白/非字符串 Name、秘密正文不输出、过期、成功恢复、
+503失败清除及目录清空。严格 Clippy 和46项测试全部成功。这是合成回归证据，
+不是第三、第四轮真实灰度结果，也不恢复旧失败门禁的发布资格。
+
+NeoStor 新源码候选将这些诊断接到固定指标API与Web，并按资产主档计入未接入
+设备。任何下一轮 IDC 变更仍需单独批准，固定新版本/源码/digest，不覆盖v0.2.5。
+空资源含义、CPU-02 NVMe及PowerSupplies物理计数仍须独立判定。
+
+## 2026-10-13 电源条目与磁盘协议诊断补齐（仍为未部署候选）
+
+CPU-02 现生产 Web 的 PowerSupplies 22 个条目含 CPU/DDR5 功耗域，不能由数组
+长度推断 22 个物理 PSU。候选 v0.2.6 不再从该数组生成 redfish_psu_*；改为
+redfish_sensor_power_supply_entry_count/info/health/output_watts，保留有界 Name、
+MemberId 及 entry_index。数组索引只用于区分当次条目，不是物理槽位或稳定身份。
+缺失状态不补正常，明确数值 0 保留，不累加可能重叠的功耗域；数组非对象或超过
+64 项使 power 组不完整。原 PowerControl 的整机功耗独立保留。
+
+CPU-02 的现生产页面已有 8 个名称为 NVMe 的资源和 4 个 SCSI 资源的逐盘健康，
+前 8 项容量各 7,681,501,126,656 字节；其汇总 NVMe 指标仍缺失。历史本机
+canary .prom 文件也已有这些条目。本轮只读已有文件 / Web，没有直接访问 BMC。
+源码确认原汇总要求所有 Drive.Protocol 都为字符串；任一缺失会省略汇总，空
+字符串却会被当非 NVMe。实机究竟哪个字段缺失或歧义仍不能仅靠 .prom 证明。
+
+候选用同一批已读取 Drive 响应输出四项 redfish_drive_* 诊断：完整读取的资源
+数、明确 Protocol=NVMe 的条目数、按 protocol_state 的数量和逐盘协议信息。
+missing/empty/invalid_type/ambiguous/unsupported 不生成完整 NVMe 总数；PCIe、
+OEM、MultiProtocol 不凭名称推断 NVMe。recognized 协议范围在代码里明确，其他
+值保留 unsupported 诊断，不泄漏任意响应正文。协议不全使 drives 组不完整，
+但仍保留有效逐盘健康 / 容量。重复链接在取详情前拒绝；不新增请求，保留 16
+个磁盘详情 / 96 整轮预算。所有详情未读齐时不生成观察总数。
+
+依据：[DMTF Drive schema](https://redfish.dmtf.org/schemas/v1/Drive.v1_22_0.json)
+与 [Protocol schema](https://redfish.dmtf.org/schemas/v1/Protocol.json)。Protocol
+描述实际通信协议，允许 null；PCIe 与 NVMe 是不同枚举，不能互相推断。这里的
+资源条目数、明确 NVMe 条目数均不是独立核验的物理库存或硬件健康。
+
+本地 52 tests passed / 0 failed / 0 ignored，严格 Clippy / fmt 通过；先复现
+缺少诊断、空协议误报零和重复链接误计数，再修复。三个 CPU profile 的本机
+HTTP 集成测试验证缺失协议仍 partial、保留逐盘值、重复链接不发详情请求。
+未测代码覆盖率（本机未安装 cargo-llvm-cov）。固定提交 CI、新镜像及自然实机
+灰度还需另验；原 v0.2.5 失败门禁不恢复，不沿用旧批准发布中心。
