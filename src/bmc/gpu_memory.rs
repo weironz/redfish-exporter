@@ -127,6 +127,14 @@ fn complete_members(doc: &Value, n: usize) -> bool {
             .is_none_or(|v| v == n as u64)
 }
 
+// Some B300 firmware advertises a non-GPU processor alongside the eight GPUs.
+// Pagination and the reported count apply to the whole collection, not the GPU subset.
+fn complete_processor_collection(doc: &Value) -> bool {
+    doc["Members"]
+        .as_array()
+        .is_some_and(|members| members.len() <= 16 && complete_members(doc, members.len()))
+}
+
 fn identity(processor: &Value, id: &str) -> Option<String> {
     let uuid = processor["UUID"].as_str()?;
     let serial = processor["SerialNumber"].as_str()?;
@@ -243,10 +251,10 @@ pub async fn collect(target: &Target, inflight: &Semaphore, floors: &Floors) -> 
             .map(|(p, v)| (p.as_str(), v.clone()))
             .collect();
         // Incomplete collection may expose slots, but not a false online total.
-        if processors.as_ref().is_some_and(|d| {
-            let items = d["Members"].as_array().map_or(0, Vec::len);
-            items <= 16 && complete_members(d, items)
-        }) {
+        if processors
+            .as_ref()
+            .is_some_and(complete_processor_collection)
+        {
             metrics::gpu_details(&mut out.inventory, &known, advertised.len());
         }
     }
@@ -303,9 +311,13 @@ pub async fn collect(target: &Target, inflight: &Semaphore, floors: &Floors) -> 
     }
     out.complete = complete_members(&memory, 8)
         && members.len() == 8
-        && details.len() == 8
+        && advertised.len() == 8
+        && repeated.is_empty()
+        && members.keys().eq(details.keys())
         && !reader.stopped
-        && processors.as_ref().is_some_and(|d| complete_members(d, 8));
+        && processors
+            .as_ref()
+            .is_some_and(complete_processor_collection);
     out.gpus = members;
     out
 }
@@ -357,9 +369,11 @@ mod tests {
                 );
             }
             if path == PROCESSORS {
-                return Json(
-                    json!({"Members":(0..8).map(|i|json!({"@odata.id":format!("{PROCESSORS}/GPU_{i}")})).collect::<Vec<_>>()}),
-                );
+                let mut members = (0..8)
+                    .map(|i| json!({"@odata.id":format!("{PROCESSORS}/GPU_{i}")}))
+                    .collect::<Vec<_>>();
+                members.push(json!({"@odata.id":format!("{PROCESSORS}/OtherProcessor")}));
+                return Json(json!({"Members":members,"Members@odata.count":9}));
             }
             if path == REPORT {
                 return Json(json!({"MetricValues":[]}));
@@ -401,6 +415,11 @@ mod tests {
         let round = collect(&t, &inflight, &Floors::new()).await;
         assert!(round.complete);
         assert_eq!(seen.lock().unwrap().len(), usize::from(LIMIT));
+        assert!(!seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.ends_with("/OtherProcessor")));
         assert_eq!(round.gpus.len(), 8);
         assert_eq!(
             round.gpus["GPU_0"].identity.as_deref(),
