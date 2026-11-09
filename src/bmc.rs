@@ -10,6 +10,7 @@ use std::{
 use tokio::sync::{Mutex, Semaphore};
 
 mod cpu_members;
+pub mod gpu_memory;
 mod sensors;
 
 const MAX_BODY: usize = 4 * 1024 * 1024;
@@ -83,6 +84,9 @@ pub struct TargetConfig {
     /// Explicit IDC opt-in. Never enabled by a central scrape query alone.
     #[serde(default)]
     slow_drive_wear: bool,
+    /// IDC opt-in; use the coordinated GPU memory cache instead of duplicate GETs.
+    #[serde(default)]
+    gpu_memory_state: bool,
 }
 
 #[derive(Default)]
@@ -105,6 +109,8 @@ pub struct Target {
     circuit: Mutex<Circuit>,
     profile: Profile,
     pub slow_drive_wear: bool,
+    pub gpu_memory_state: bool,
+    pub gpu_memory_snapshot: Mutex<Option<crate::gpu_memory::Snapshot>>,
     pub slow_lock: Mutex<()>,
     pub slow_snapshot: Mutex<Option<String>>,
     pub slow_due: Mutex<Option<Instant>>,
@@ -135,6 +141,9 @@ impl FetchError {
 }
 
 impl Target {
+    pub fn address(&self) -> &str {
+        &self.address
+    }
     pub fn binding_matches(&self, address: &str, profile: &str, credential_ref: &str) -> bool {
         self.address == address
             && self.profile.id() == profile
@@ -177,6 +186,9 @@ impl Target {
         if config.slow_drive_wear && config.profile != Profile::AsrockrackB3008u16x {
             bail!("slow drive wear is currently supported only by B300 profile");
         }
+        if config.gpu_memory_state && config.profile != Profile::AsrockrackB3008u16x {
+            bail!("GPU memory state is currently supported only by B300 profile");
+        }
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(config.insecure_tls)
             .redirect(reqwest::redirect::Policy::none())
@@ -195,6 +207,8 @@ impl Target {
             circuit: Mutex::new(Circuit::default()),
             profile: config.profile,
             slow_drive_wear: config.slow_drive_wear,
+            gpu_memory_state: config.gpu_memory_state,
+            gpu_memory_snapshot: Mutex::new(None),
             slow_lock: Mutex::new(()),
             slow_snapshot: Mutex::new(None),
             slow_due: Mutex::new(None),
@@ -219,6 +233,7 @@ impl Target {
                 insecure_tls: false,
                 profile,
                 slow_drive_wear: false,
+                gpu_memory_state: false,
             },
             reqwest::Url::parse(base).expect("mock URL"),
         )
@@ -861,31 +876,44 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
     {
         metrics::board_power(&mut out.samples, &v);
     }
-    if let Some(v) = out
-        .fetch(
-            name,
-            target,
-            inflight,
-            "/redfish/v1/Systems/HGX_Baseboard_0/Processors",
-        )
-        .await
-    {
-        let gpu_refs: Vec<String> = refs(&v, "Members", 16)
-            .into_iter()
-            .filter(|path| {
-                path.rsplit('/')
-                    .next()
-                    .is_some_and(|id| id.starts_with("GPU_"))
-            })
-            .collect();
-        metrics::gpu_slots(&mut out.samples, gpu_refs.len());
-        let mut gpu_details = Vec::new();
-        for reference in &gpu_refs {
-            if let Some(gpu) = out.fetch(name, target, inflight, reference).await {
-                gpu_details.push((reference.as_str(), gpu));
-            }
+    if target.gpu_memory_state {
+        // Use the coordinated read for both the hardware and alert paths.
+        if let Some(snapshot) = target
+            .gpu_memory_snapshot
+            .lock()
+            .await
+            .as_ref()
+            .filter(|s| s.fresh(metrics::epoch()))
+        {
+            out.samples.extend(snapshot.inventory.iter().cloned());
         }
-        metrics::gpu_details(&mut out.samples, &gpu_details, gpu_refs.len());
+    } else {
+        if let Some(v) = out
+            .fetch(
+                name,
+                target,
+                inflight,
+                "/redfish/v1/Systems/HGX_Baseboard_0/Processors",
+            )
+            .await
+        {
+            let gpu_refs: Vec<String> = refs(&v, "Members", 16)
+                .into_iter()
+                .filter(|path| {
+                    path.rsplit('/')
+                        .next()
+                        .is_some_and(|id| id.starts_with("GPU_"))
+                })
+                .collect();
+            metrics::gpu_slots(&mut out.samples, gpu_refs.len());
+            let mut gpu_details = Vec::new();
+            for reference in &gpu_refs {
+                if let Some(gpu) = out.fetch(name, target, inflight, reference).await {
+                    gpu_details.push((reference.as_str(), gpu));
+                }
+            }
+            metrics::gpu_details(&mut out.samples, &gpu_details, gpu_refs.len());
+        }
     }
     if let Some(v) = out
         .fetch(
@@ -898,16 +926,18 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
     {
         metrics::gpu_environment(&mut out.samples, &v);
     }
-    if let Some(v) = out
-        .fetch(
-            name,
-            target,
-            inflight,
-            "/redfish/v1/TelemetryService/MetricReports/HGX_MemoryMetrics_0",
-        )
-        .await
-    {
-        metrics::gpu_memory(&mut out.samples, &v);
+    if !target.gpu_memory_state {
+        if let Some(v) = out
+            .fetch(
+                name,
+                target,
+                inflight,
+                "/redfish/v1/TelemetryService/MetricReports/HGX_MemoryMetrics_0",
+            )
+            .await
+        {
+            metrics::gpu_memory(&mut out.samples, &v);
+        }
     }
     out
 }
@@ -1038,7 +1068,8 @@ mod tests {
                 password: "b".into(),
                 insecure_tls: true,
                 profile: Profile::AsrockrackB3008u16x,
-                slow_drive_wear: false
+                slow_drive_wear: false,
+                gpu_memory_state: false,
             })
             .is_err());
         }
