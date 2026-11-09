@@ -22,3 +22,17 @@ GitHub Actions 的完整提交 SHA。运行时检查使用 `--network none`、�
 
 本机 Docker Desktop 启动异常时，可以从可信 CI 下载产物，用支持 Docker archive
 的仓库客户端推送，不依赖本机 Docker Engine。不得通过清卷或工厂重置绕过故障。
+
+## 二进制 Release 与 CI 的边界
+
+`release.yml` 是另一条仅 `workflow_dispatch` 的工作流，由 `just release <version>`
+显式触发，通过 `workflow_call` 复用本 CI 作为门禁（rust / image / image-ready）。
+它在 Ubuntu runner 上用同一固定 Dockerfile 构建 Linux x86_64 二进制，在隔离容器
+中校验 `--version` 与 tag 源码的完整 SHA，然后把 tar.gz、裸二进制和 SHA256SUMS
+写入 GitHub Release，并保留同名 workflow artifact 供审计。`just dry-run <version>`
+只构建校验，不改动已发布的 Release。
+
+它是仓库中唯一持有 `contents: write` 的工作流，且仅在该 publish job 内生效；
+CI 仍为 `contents: read`。它不由 push 或 tag 事件自动触发，不推送镜像、不改
+registry tag、不做生产部署。镜像发布仍按上述 1–5 条人工校验执行；二进制
+Release 与镜像发布是两条独立链路，任一条成功都不构成另一条的发布授权。

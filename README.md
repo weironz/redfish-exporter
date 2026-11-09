@@ -19,10 +19,26 @@ No new IDC inbound firewall port is required. This exporter never requires tenan
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-docker build -t redfish-exporter:v0.2.6 .
+just build-linux-x64     # Linux x86_64 binary via Docker; no local Rust toolchain needed
 ```
 
 The container image is built locally; this repository does not automatically publish or deploy it. NeoStor's optional Compose `redfish` profile can reference a version-pinned image from an approved registry or a locally loaded image.
+
+## Releasing
+
+Releases are **controlled and manual**: no push, tag or schedule event creates a tag, a binary or a Release. `just` is the entry point (`winget install --id Casey.Just` on Windows, `brew install just` on macOS); `scripts/release.sh` is the underlying implementation and can also be invoked directly.
+
+```bash
+just ci                      # dispatch the CI gate on main, wait for rust/image/image-ready
+just preflight 0.2.9         # version vs Cargo.toml, clean tree, main sync, tag collisions
+just release 0.2.9           # preflight -> CI -> annotated tag -> push -> release.yml -> verify
+just dry-run 0.2.8           # build/verify assets for an existing tag; no Release mutation
+just verify-release 0.2.8    # re-download published assets and check SHA256SUMS
+```
+
+Before `just release`, bump `version` in `Cargo.toml` (and `Cargo.lock`) and commit it to `main`. `release.yml` reuses `ci.yml` through `workflow_call` as its quality gate, then builds the Linux x86_64 binary from the fixed Dockerfile on an Ubuntu runner, verifies `--version` against the tagged source SHA, and publishes three assets: `redfish-exporter-vX.Y.Z-linux-x86_64.tar.gz` (binary with executable bit plus `README.txt`), the standalone `redfish-exporter-vX.Y.Z-linux-x86_64` binary, and `SHA256SUMS`. The same assets are retained as a workflow artifact for audit. `release.yml` is the only workflow holding `contents: write`, scoped to its publish job; CI keeps `contents: read`.
+
+Only Linux x86_64 binaries are published (glibc >= 2.36, rustls/webpki roots, no OpenSSL). Publishing a binary does not publish a container image, change a registry tag or deploy anything; image publication and IDC enrollment still follow [the controlled publication checks](docs/ci-image-artifact.md) and their own approvals.
 
 ## Configuration
 

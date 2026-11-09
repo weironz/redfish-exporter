@@ -1,6 +1,9 @@
 name: CI
 on:
+  # Deliberately manual only. release.yml calls this workflow as its quality
+  # gate; no push or tag event runs any job in this repository automatically.
   workflow_dispatch: {}
+  workflow_call: {}
 
 permissions:
   contents: read

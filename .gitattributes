@@ -1,0 +1,4 @@
+# Shell scripts and workflow files must keep LF even with core.autocrlf=true.
+*.sh text eol=lf
+justfile text eol=lf
+.github/workflows/*.yml text eol=lf

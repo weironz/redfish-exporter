@@ -1,0 +1,170 @@
+name: Release
+
+# Controlled publication only: no push, no tag event, no schedule. A human
+# runs `just release <version>` (or `just dry-run <version>`), which dispatches
+# this workflow explicitly. The CI workflow is reused as the quality gate.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish, e.g. v0.2.9. Must already exist on the remote."
+        required: true
+        type: string
+      dry_run:
+        description: "Build and verify assets only; never create or modify a Release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    uses: ./.github/workflows/ci.yml
+
+  linux-x64:
+    needs: [gate]
+    runs-on: ubuntu-latest
+    # Only this job can write. The CI gate keeps contents: read.
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Validate tag format
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag must match vX.Y.Z"; exit 1; }
+
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify Cargo.toml version and resolve source SHA
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          test "v$VERSION" = "$TAG" || { echo "::error::Cargo.toml $VERSION does not match $TAG"; exit 1; }
+          SHA=$(git rev-parse HEAD)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA=$SHA" >> "$GITHUB_ENV"
+          echo "Building $TAG from $SHA (Cargo.toml $VERSION)"
+
+      - name: Build linux/amd64 image from the fixed Dockerfile
+        run: |
+          set -euo pipefail
+          docker build --build-arg GIT_SHA="$SOURCE_SHA" -t redfish-exporter:ci .
+          PLATFORM=$(docker image inspect redfish-exporter:ci --format '{{.Os}}/{{.Architecture}}')
+          test "$PLATFORM" = "linux/amd64" || { echo "::error::unexpected platform $PLATFORM"; exit 1; }
+
+      - name: Verify isolated --version against the tagged source SHA
+        run: |
+          set -euo pipefail
+          ACTUAL=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges redfish-exporter:ci --version)
+          test "$ACTUAL" = "redfish-exporter v$VERSION ($SOURCE_SHA)" || { echo "::error::unexpected version: $ACTUAL"; exit 1; }
+          echo "$ACTUAL"
+
+      - name: Extract and inspect the binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CID=$(docker create redfish-exporter:ci)
+          docker cp "$CID:/usr/local/bin/redfish-exporter" dist/redfish-exporter
+          docker rm "$CID" >/dev/null
+          chmod 755 dist/redfish-exporter
+          python3 -c 'import struct; b=open("dist/redfish-exporter","rb").read(20); assert b[:4]==b"\x7fELF" and b[4]==2 and struct.unpack_from("<H",b,18)[0]==0x3e; print("ELF64 x86-64 OK")'
+          docker run --rm --entrypoint ldd redfish-exporter:ci /usr/local/bin/redfish-exporter
+
+      - name: Package archive, standalone binary and checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          BIN="redfish-exporter-$TAG-linux-x86_64"
+          ARCHIVE="$BIN.tar.gz"
+          STAGE="redfish-exporter-$VERSION"
+          cp redfish-exporter "$BIN"
+          chmod 755 "$BIN"
+          mkdir -p "$STAGE"
+          cp redfish-exporter "$STAGE/redfish-exporter"
+          chmod 755 "$STAGE/redfish-exporter"
+          printf '%s\n' \
+            "redfish-exporter $TAG - Linux x86_64 binary" \
+            "==========================================" \
+            "" \
+            "Source revision : $SOURCE_SHA" \
+            "Build           : cargo build --locked --release with rust 1.98.1, using the" \
+            "                  repository Dockerfile. This is the binary copied into the" \
+            "                  checked redfish-exporter:ci image." \
+            "Quality gate    : CI workflow, run $GITHUB_RUN_ID" \
+            "" \
+            "Requirements" \
+            "- Linux x86_64, glibc >= 2.36 (Debian 12+, Ubuntu 22.04+/24.04)." \
+            "- Dynamically linked to libgcc_s, libm, libc and ld-linux only." \
+            "  TLS uses rustls with compiled-in webpki roots; no OpenSSL needed." \
+            "- A private redfish-targets.json (see examples/ in the repository)." \
+            "" \
+            "Verify: sha256sum -c SHA256SUMS && ./redfish-exporter --version" \
+            "Run:    REDFISH_EXPORTER_TARGETS_FILE=/run/secrets/redfish-targets.json ./redfish-exporter" \
+            "" \
+            "Default bind is 127.0.0.1:19626. This release only publishes a binary;" \
+            "it does not change any registry tag, configuration or deployment." \
+            > "$STAGE/README.txt"
+          chmod 644 "$STAGE/README.txt"
+          tar --owner=0 --group=0 --numeric-owner -czf "$ARCHIVE" "$STAGE"
+          sha256sum "$ARCHIVE" "$BIN" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -l "$ARCHIVE" "$BIN" SHA256SUMS
+
+      - name: Keep assets for audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: redfish-exporter-${{ inputs.tag }}-linux-x86_64
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            dist/redfish-exporter-${{ inputs.tag }}-linux-x86_64.tar.gz
+            dist/redfish-exporter-${{ inputs.tag }}-linux-x86_64
+            dist/SHA256SUMS
+
+      - name: Create or update GitHub Release
+        if: ${{ inputs.dry_run == false }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          BIN="redfish-exporter-$TAG-linux-x86_64"
+          ARCHIVE="$BIN.tar.gz"
+          printf '%s\n' \
+            "Linux x86_64 binary for $TAG." \
+            "" \
+            "Source revision: $SOURCE_SHA. Built with rust 1.98.1 from the repository" \
+            "Dockerfile after the CI quality gate passed. ELF64 x86-64, glibc >= 2.36," \
+            "rustls/webpki roots, no OpenSSL dependency." \
+            "" \
+            "Assets: $ARCHIVE (binary with executable bit + README.txt), the standalone" \
+            "$BIN binary, and SHA256SUMS. Verify with: sha256sum -c SHA256SUMS" \
+            "" \
+            "Quality gate: CI workflow reused by release run $GITHUB_RUN_ID." \
+            "This release publishes a binary only; no image tag or deployment changed." \
+            > notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ARCHIVE" "$BIN" SHA256SUMS --clobber
+          else
+            gh release create "$TAG" --verify-tag \
+              --title "$TAG — Linux x86_64 binary" \
+              --notes-file notes.md \
+              "$ARCHIVE#Linux x86_64 archive" \
+              "$BIN#Standalone binary" \
+              "SHA256SUMS#Checksums"
+          fi
+          gh release view "$TAG" --json tagName,assets \
+            --jq '{tag: .tagName, assets: [.assets[].name]}'
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          echo "Dry run complete: assets built and verified; no Release was created or modified."
