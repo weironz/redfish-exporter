@@ -10,7 +10,12 @@ pub struct Metric {
     source_ms: Option<u64>,
 }
 
-fn add(out: &mut Vec<Metric>, name: &'static str, labels: Vec<(&'static str, String)>, value: f64) {
+pub(crate) fn add(
+    out: &mut Vec<Metric>,
+    name: &'static str,
+    labels: Vec<(&'static str, String)>,
+    value: f64,
+) {
     if value.is_finite() {
         out.push(Metric {
             name,
@@ -1040,6 +1045,24 @@ pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
         output.push('\n');
     }
     output
+}
+
+/// Compatibility endpoint: preserve the Python exporter labels, without adding
+/// the baseline /metrics target label to existing alert identities.
+pub(crate) fn render_gpu_memory(samples: &[Metric]) -> String {
+    use std::fmt::Write;
+    let mut body = String::new();
+    for sample in samples {
+        let _ = write!(body, "{}{{", sample.name);
+        for (i, (key, value)) in sample.labels.iter().enumerate() {
+            if i != 0 {
+                body.push(',');
+            }
+            let _ = write!(body, "{}=\"{}\"", key, escape_label(value));
+        }
+        let _ = writeln!(body, "}} {}", sample.value);
+    }
+    body
 }
 
 #[cfg(test)]

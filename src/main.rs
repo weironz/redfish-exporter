@@ -1,6 +1,7 @@
 //! Standalone, read-only multi-model Redfish exporter.
 mod bmc;
 mod capabilities;
+mod gpu_memory;
 mod metrics;
 
 use anyhow::{bail, Context, Result};
@@ -12,7 +13,13 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::sync::Semaphore;
 
 #[derive(Deserialize)]
@@ -175,6 +182,126 @@ async fn slow_metrics(
         .into_response()
 }
 
+async fn gpu_memory_metrics(
+    State(app): State<App>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(target) = q.get("target").and_then(|alias| app.targets.get(alias)) else {
+        return (StatusCode::NOT_FOUND, "configured target alias required").into_response();
+    };
+    if !target.gpu_memory_state {
+        return (StatusCode::NOT_FOUND, "GPU memory state disabled").into_response();
+    }
+    let state = target.gpu_memory_snapshot.lock().await;
+    let Some(snapshot) = state.as_ref().filter(|s| s.fresh(metrics::epoch())) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GPU memory snapshot not ready",
+        )
+            .into_response();
+    };
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        metrics::render_gpu_memory(&snapshot.state),
+    )
+        .into_response()
+}
+
+fn start_gpu_memory(app: &App) -> Result<()> {
+    let mut opted_in: Vec<_> = app
+        .targets
+        .iter()
+        .filter(|(_, target)| target.gpu_memory_state)
+        .collect();
+    if opted_in.is_empty() {
+        return Ok(());
+    }
+    opted_in.sort_unstable_by_key(|(name, _)| *name);
+    for (_, target) in &opted_in {
+        if app
+            .targets
+            .values()
+            .filter(|other| other.address() == target.address())
+            .count()
+            != 1
+        {
+            bail!("GPU memory state requires one alias per BMC");
+        }
+    }
+    let path = std::env::var_os("REDFISH_EXPORTER_GPU_MEMORY_STATE_FILE")
+        .context("GPU memory opt-in requires REDFISH_EXPORTER_GPU_MEMORY_STATE_FILE")?;
+    let interval = std::env::var("REDFISH_EXPORTER_GPU_MEMORY_INTERVAL_SECS")
+        .unwrap_or_else(|_| "300".into())
+        .parse::<u64>()
+        .context("invalid GPU memory polling interval")?;
+    if !(300..=480).contains(&interval) {
+        bail!("GPU memory polling interval must be 300..=480 seconds");
+    }
+    let tracker = Arc::new(Mutex::new(gpu_memory::Tracker::load(path.into())?));
+    // One schedule per target. Stagger all devices; cap concurrent background
+    // rounds and reuse the ordinary per-GET admission and BMC mutex.
+    let admission = Arc::new(Semaphore::new(2));
+    let count = opted_in.len() as u64;
+    for (i, (name, target)) in opted_in.into_iter().enumerate() {
+        let name = name.clone();
+        let target = Arc::clone(target);
+        let inflight = Arc::clone(&app.inflight);
+        let admission = Arc::clone(&admission);
+        let tracker = Arc::clone(&tracker);
+        tokio::spawn(async move {
+            use tokio::time::{self, Instant, MissedTickBehavior};
+            let delay = Duration::from_secs(i as u64 * interval / count);
+            let mut ticker =
+                time::interval_at(Instant::now() + delay, Duration::from_secs(interval));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                // Do not pile up overdue rounds under load.
+                let Ok(permit) = time::timeout(Duration::from_secs(10), admission.acquire()).await
+                else {
+                    continue;
+                };
+                let Ok(_permit) = permit else { return };
+                let t = Arc::clone(&tracker);
+                let address = target.address().to_owned();
+                let floor_address = address.clone();
+                let floors = tokio::task::spawn_blocking(move || {
+                    t.lock().map(|state| state.floors(&floor_address)).ok()
+                })
+                .await
+                .ok()
+                .flatten();
+                let Some(floors) = floors else {
+                    *target.gpu_memory_snapshot.lock().await = None;
+                    continue;
+                };
+                let round = bmc::gpu_memory::collect(&target, &inflight, &floors).await;
+                let now = metrics::epoch();
+                let t = Arc::clone(&tracker);
+                let host = name.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    t.lock()
+                        .map_err(|_| anyhow::anyhow!("GPU baseline lock poisoned"))?
+                        .apply(&host, &address, round, now)
+                })
+                .await;
+                let new = match result {
+                    Ok(Ok(snapshot)) => Some(snapshot),
+                    _ => {
+                        tracing::warn!(target = name, "GPU memory snapshot persistence failed");
+                        None
+                    }
+                };
+                *target.gpu_memory_snapshot.lock().await = new;
+            }
+        });
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--version") {
@@ -200,6 +327,7 @@ async fn main() -> Result<()> {
         inflight: Arc::new(Semaphore::new(4)),
         slow_inflight: Arc::new(Semaphore::new(1)),
     };
+    start_gpu_memory(&app)?;
     tracing::info!(targets = app.targets.len(), %bind, "read-only Redfish exporter starting");
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(
@@ -210,6 +338,7 @@ async fn main() -> Result<()> {
             .route("/binding-check", post(binding_check))
             .route("/metrics", get(scrape))
             .route("/slow-metrics", get(slow_metrics))
+            .route("/gpu-memory-metrics", get(gpu_memory_metrics))
             .layer(axum::extract::DefaultBodyLimit::max(4096))
             .with_state(app),
     )
@@ -243,6 +372,44 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(target.slow_due.lock().await.is_none());
     }
+    #[tokio::test]
+    async fn gpu_memory_endpoint_is_cache_only_and_expired_state_is_unavailable() {
+        let t = Arc::new(bmc::Target::new(serde_json::from_value(serde_json::json!({
+            "address":"10.0.0.1","username":"fixture","password":"fixture","gpu_memory_state":true
+        })).unwrap()).unwrap());
+        let _guard = t.scrape_lock.lock().await;
+        let app = App {
+            targets: Arc::new(HashMap::from([("fixture".into(), t.clone())])),
+            inflight: Arc::new(Semaphore::new(1)),
+            slow_inflight: Arc::new(Semaphore::new(1)),
+        };
+        let query = || Query(HashMap::from([("target".into(), "fixture".into())]));
+        assert_eq!(
+            gpu_memory_metrics(State(app.clone()), query())
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let snapshot = |observed_at| gpu_memory::Snapshot {
+            observed_at,
+            state: vec![],
+            inventory: vec![],
+        };
+        *t.gpu_memory_snapshot.lock().await = Some(snapshot(metrics::epoch()));
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            gpu_memory_metrics(State(app.clone()), query()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        *t.gpu_memory_snapshot.lock().await = Some(snapshot(metrics::epoch() - 601.0));
+        assert_eq!(
+            gpu_memory_metrics(State(app), query()).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
     #[tokio::test]
     async fn binding_check_is_exact_fail_closed_and_never_probes_bmc() {
         let target = bmc::Target::new(

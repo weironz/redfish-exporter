@@ -1,11 +1,12 @@
 [package]
 name = "redfish-exporter"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 description = "Read-only Prometheus exporter for B300, TYAN and ASRockRack BMC Redfish telemetry"
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 axum = "0.8"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
