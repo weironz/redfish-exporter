@@ -363,6 +363,9 @@ fn path_group(path: &str) -> &'static str {
     }
 }
 
+const B300_THERMAL: &str = "/redfish/v1/Chassis/BMC_0/Thermal";
+const B300_FANS: &str = "/redfish/v1/Chassis/BMC_0/ThermalSubsystem/Fans";
+
 /// A slow batch never takes the lock for the entire batch. A waiting fast scrape
 /// gets the fair mutex before the next slow GET. At most one 30s request delays it.
 pub async fn collect_drive_wear(name: &str, target: &Target, inflight: &Semaphore) -> Collection {
@@ -449,6 +452,7 @@ pub struct Collection {
     requests: usize,
     budget_exhausted: bool,
     pub failed_groups: std::collections::BTreeSet<&'static str>,
+    pub b300_thermal_groups: bool,
 }
 
 impl Collection {
@@ -461,6 +465,7 @@ impl Collection {
             requests: 0,
             budget_exhausted: false,
             failed_groups: Default::default(),
+            b300_thermal_groups: false,
         }
     }
 
@@ -471,12 +476,25 @@ impl Collection {
         inflight: &Semaphore,
         path: &str,
     ) -> Option<Value> {
+        self.fetch_group(name, target, inflight, path, path_group(path), false)
+            .await
+    }
+
+    async fn fetch_group(
+        &mut self,
+        name: &str,
+        target: &Target,
+        inflight: &Semaphore,
+        path: &str,
+        group: &'static str,
+        allow_not_found: bool,
+    ) -> Option<Value> {
         if self.blocked {
-            self.failed_groups.insert(path_group(path));
+            self.failed_groups.insert(group);
             return None;
         }
         if self.requests >= MAX_REQUESTS_PER_SCRAPE {
-            self.failed_groups.insert(path_group(path));
+            self.failed_groups.insert(group);
             if !self.budget_exhausted {
                 self.errors = self.errors.saturating_add(1);
                 self.budget_exhausted = true;
@@ -486,8 +504,9 @@ impl Collection {
         self.requests += 1;
         match target.get(path, inflight).await {
             Ok(value) => Some(value),
+            Err(FetchError::Http(404)) if allow_not_found => None,
             Err(error) => {
-                self.failed_groups.insert(path_group(path));
+                self.failed_groups.insert(group);
                 tracing::warn!(
                     target = name,
                     path,
@@ -688,6 +707,7 @@ async fn collect_cpu_chassis(
 }
 
 pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Collection {
+    let b300_thermal_groups = target.profile == Profile::AsrockrackB3008u16x;
     if let Some(forbidden) = target.blocked().await {
         return Collection {
             samples: Vec::new(),
@@ -697,6 +717,7 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
             requests: 0,
             budget_exhausted: false,
             failed_groups: ["health", "compute", "drives", "network", "power", "gpu"].into(),
+            b300_thermal_groups,
         };
     }
     let mut out = Collection {
@@ -707,6 +728,7 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
         requests: 1,
         budget_exhausted: false,
         failed_groups: Default::default(),
+        b300_thermal_groups,
     };
     let probe = tokio::time::timeout(
         Duration::from_secs(10),
@@ -746,7 +768,7 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
     );
     metrics::system(&mut out.samples, &system);
 
-    if target.profile != Profile::AsrockrackB3008u16x {
+    if !b300_thermal_groups {
         collect_cpu(name, target, inflight, &mut out, &system).await;
         return out;
     }
@@ -828,10 +850,14 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
         metrics::manager(&mut out.samples, &v);
     }
     if let Some(v) = out
-        .fetch(name, target, inflight, "/redfish/v1/Chassis/BMC_0/Thermal")
+        .fetch_group(name, target, inflight, B300_THERMAL, "thermal", true)
         .await
     {
         metrics::thermal(&mut out.samples, &v);
+    } else if !out.failed_groups.contains("thermal") {
+        if let Some(fans) = sensors::directory(name, target, inflight, &mut out, B300_FANS).await {
+            metrics::fan_count(&mut out.samples, fans.len());
+        }
     }
     if let Some(v) = out
         .fetch(
@@ -1210,6 +1236,74 @@ mod tests {
         assert!(first.blocked && second.blocked);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(first.samples.is_empty() && second.samples.is_empty());
+    }
+
+    #[tokio::test]
+    async fn b300_fan_pages_and_board_power_are_independent() {
+        for complete in [true, false] {
+            let app = Router::new().fallback(get(move |uri: Uri| async move {
+                use axum::response::IntoResponse;
+                let value = match uri.path() {
+                    B300_THERMAL => return StatusCode::NOT_FOUND.into_response(),
+                    B300_FANS => {
+                        let start = if uri.query().is_none() { 0 } else { 50 };
+                        let end = if start == 0 {
+                            50
+                        } else if complete {
+                            76
+                        } else {
+                            75
+                        };
+                        let mut page = json!({
+                            "Members@odata.count": 76,
+                            "Members": (start..end).map(|id| json!({
+                                "@odata.id": format!("{B300_FANS}/{id}")
+                            })).collect::<Vec<_>>(),
+                        });
+                        if start == 0 {
+                            page["Members@odata.nextLink"] = json!(format!("{B300_FANS}?$skip=50"));
+                        }
+                        page
+                    }
+                    "/redfish/v1/Chassis/HGX_Chassis_0/EnvironmentMetrics" => {
+                        json!({"PowerWatts": {"Reading": 2337}})
+                    }
+                    path if path.starts_with(B300_FANS) => {
+                        panic!("inventory fallback must not request fan details");
+                    }
+                    _ => json!({"Members": []}),
+                };
+                Json(value).into_response()
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let target = Target::mock(&format!("http://{addr}/"));
+            let result = collect("B300-38", &target, &Semaphore::new(1)).await;
+            assert_eq!(result.failed_groups.contains("thermal"), !complete);
+            let rendered = metrics::render("B300-38", result, 1.0);
+            assert!(rendered.contains("redfish_board_power_watts{target=\"B300-38\"} 2337"));
+            for (group, success) in [
+                ("power", true),
+                ("thermal", complete),
+                ("fan_details", false),
+            ] {
+                let value = u8::from(success);
+                assert!(
+                    rendered.contains(&format!(
+                        "redfish_group_success{{target=\"B300-38\",group=\"{group}\"}} {value}"
+                    )),
+                    "{rendered}"
+                );
+            }
+            assert_eq!(
+                rendered.contains("redfish_fan_count{target=\"B300-38\"} 76"),
+                complete
+            );
+            assert!(!rendered.contains("redfish_fan_rpm{"));
+            assert!(!rendered.contains("redfish_fan_health{"));
+            server.abort();
+        }
     }
 
     #[tokio::test]
