@@ -574,9 +574,13 @@ pub fn manager(out: &mut Vec<Metric>, value: &Value) {
     );
 }
 
+pub fn fan_count(out: &mut Vec<Metric>, count: usize) {
+    add(out, "redfish_fan_count", vec![], count as f64);
+}
+
 pub fn thermal(out: &mut Vec<Metric>, value: &Value) {
     if let Some(fans) = value["Fans"].as_array() {
-        add(out, "redfish_fan_count", vec![], fans.len() as f64);
+        fan_count(out, fans.len());
         for fan in fans {
             let labels = vec![("name", string(&fan["Name"]))];
             add(
@@ -948,10 +952,16 @@ fn escape_label(value: &str) -> String {
 
 pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
     let observed = epoch();
+    let b300_thermal_groups = result.b300_thermal_groups;
+    let sample_group = |name| match (b300_thermal_groups, name) {
+        (true, "redfish_fan_count" | "redfish_temperature_celsius") => Some("thermal"),
+        (true, "redfish_fan_health" | "redfish_fan_rpm") => Some("fan_details"),
+        _ => group(name),
+    };
     let present: BTreeSet<_> = result
         .samples
         .iter()
-        .filter_map(|m| group(m.name))
+        .filter_map(|m| sample_group(m.name))
         .collect();
     // Request success is not component health. Missing groups remain unknown.
     let baseline = !result.samples.iter().any(|m| {
@@ -961,6 +971,11 @@ pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
     });
     for id in ["health", "compute", "drives", "network", "power", "gpu"]
         .into_iter()
+        .chain(
+            ["thermal", "fan_details"]
+                .into_iter()
+                .filter(|_| b300_thermal_groups),
+        )
         .filter(|_| baseline)
     {
         let successful = result.up
@@ -983,7 +998,7 @@ pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
             let source = result
                 .samples
                 .iter()
-                .filter(|sample| group(sample.name) == Some(id))
+                .filter(|sample| sample_group(sample.name) == Some(id))
                 .filter_map(|sample| sample.source_ms)
                 .map(|source| source as f64 / 1000.)
                 .fold(observed, f64::min);
