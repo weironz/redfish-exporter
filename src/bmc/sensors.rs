@@ -77,20 +77,26 @@ fn page_offset(path: &str, root: &str) -> Option<usize> {
     offset
 }
 
-async fn directory(
+pub(super) async fn directory(
     name: &str,
     target: &Target,
     inflight: &Semaphore,
     out: &mut Collection,
     root: &str,
 ) -> Option<Vec<String>> {
+    let fan_inventory = root == super::B300_FANS;
+    let group = if fan_inventory { "thermal" } else { "power" };
+    let invalid = |out: &mut Collection| {
+        out.failed_groups.insert(group);
+        out.errors = out.errors.saturating_add(1);
+    };
     if root.contains('?')
         || root.len() > 256
         || !safe_path(root)
         || !root.starts_with("/redfish/v1/Chassis/")
-        || !root.ends_with("/Sensors")
+        || (!fan_inventory && !root.ends_with("/Sensors"))
     {
-        incomplete(out);
+        invalid(out);
         return None;
     }
     let mut next = root.to_owned();
@@ -98,62 +104,69 @@ async fn directory(
     let mut paths = BTreeSet::new();
     let mut advertised = None;
     for _ in 0..MAX_PAGES {
-        let Some(offset) = page_offset(&next, root)
-            .filter(|offset| previous_offset.is_none_or(|previous| *offset > previous))
-        else {
-            incomplete(out);
+        let Some(offset) = page_offset(&next, root).filter(|offset| {
+            previous_offset.is_none_or(|previous| *offset > previous)
+                && (!fan_inventory || *offset == paths.len())
+        }) else {
+            invalid(out);
             return None;
         };
         previous_offset = Some(offset);
-        let page = out.fetch(name, target, inflight, &next).await?;
+        let page = out
+            .fetch_group(name, target, inflight, &next, group, false)
+            .await?;
         let Some(members) = page["Members"].as_array() else {
-            incomplete(out);
+            invalid(out);
             return None;
         };
         if let Some(raw) = page.get("Members@odata.count") {
             let Some(count) = raw.as_u64().filter(|count| *count <= MAX_SENSORS as u64) else {
-                incomplete(out);
+                invalid(out);
                 return None;
             };
             if advertised.is_some_and(|previous| previous != count) {
-                incomplete(out);
+                invalid(out);
                 return None;
             }
             advertised = Some(count);
         }
+        let prefix = format!("{root}/");
         for member in members {
             let Some(path) = member["@odata.id"].as_str().filter(|path| {
-                path.starts_with(&format!("{root}/"))
+                path.strip_prefix(&prefix)
+                    .is_some_and(|id| !fan_inventory || (!id.is_empty() && !id.contains('/')))
                     && path.len() <= root.len() + 129
                     && safe_path(path)
                     && !path.contains('?')
             }) else {
-                incomplete(out);
+                invalid(out);
                 return None;
             };
             if !paths.insert(path.to_owned()) || paths.len() > MAX_SENSORS {
-                incomplete(out);
+                invalid(out);
                 return None;
             }
         }
         match page.get("Members@odata.nextLink").filter(|v| !v.is_null()) {
             Some(link) => {
                 let Some(path) = link.as_str().filter(|_| !members.is_empty()) else {
-                    incomplete(out);
+                    invalid(out);
                     return None;
                 };
                 next = path.to_owned();
             }
             None => {
-                if advertised.is_some_and(|count| count != paths.len() as u64) {
-                    incomplete(out);
+                if (fan_inventory && advertised.is_none())
+                    || advertised.is_some_and(|count| count != paths.len() as u64)
+                {
+                    invalid(out);
                     return None;
                 }
                 return Some(paths.into_iter().collect());
             }
         }
     }
-    incomplete(out);
+    invalid(out);
     None
 }
 

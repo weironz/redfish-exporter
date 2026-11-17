@@ -33,9 +33,13 @@ struct App {
     targets: Arc<HashMap<String, Arc<bmc::Target>>>,
     inflight: Arc<Semaphore>,
     slow_inflight: Arc<Semaphore>,
+    slow_interval: Duration,
 }
 
-fn load_targets(path: &Path) -> Result<HashMap<String, Arc<bmc::Target>>> {
+fn load_targets(
+    path: &Path,
+    enable_b300_drive_wear: bool,
+) -> Result<HashMap<String, Arc<bmc::Target>>> {
     let metadata = std::fs::metadata(path).with_context(|| format!("targets file {path:?}"))?;
     #[cfg(unix)]
     {
@@ -62,7 +66,11 @@ fn load_targets(path: &Path) -> Result<HashMap<String, Arc<bmc::Target>>> {
             {
                 bail!("invalid target name");
             }
-            Ok((name, Arc::new(bmc::Target::new(config)?)))
+            let mut target = bmc::Target::new(config)?;
+            if enable_b300_drive_wear {
+                target.enable_b300_drive_wear();
+            }
+            Ok((name, Arc::new(target)))
         })
         .collect()
 }
@@ -94,6 +102,41 @@ async fn capability(State(app): State<App>, Query(q): Query<HashMap<String, Stri
     }
 }
 
+async fn refresh_drive_wear(
+    name: String,
+    target: Arc<bmc::Target>,
+    admission: Arc<Semaphore>,
+    interval: Duration,
+) {
+    // Dedupe queued and active batches without locking the fast scrape.
+    let Ok(_target_slot) = target.slow_lock.try_lock() else {
+        return;
+    };
+    if target
+        .slow_due
+        .lock()
+        .await
+        .is_some_and(|last| last.elapsed() < interval)
+    {
+        return;
+    }
+    // Wait outside the batch timeout and never hold the BMC lock in this queue.
+    let Ok(_batch_slot) = admission.acquire().await else {
+        return;
+    };
+    *target.slow_due.lock().await = Some(std::time::Instant::now());
+    let result = tokio::time::timeout(
+        Duration::from_secs(90),
+        bmc::collect_drive_wear(&name, &target),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        tracing::warn!(target = name, "slow Redfish drive wear batch timed out");
+        bmc::Collection::failed()
+    });
+    *target.slow_snapshot.lock().await = Some(metrics::render_slow(&name, result));
+}
+
 async fn scrape(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Response {
     let Some(name) = q.get("target") else {
         return (StatusCode::BAD_REQUEST, "missing target").into_response();
@@ -118,29 +161,19 @@ async fn scrape(State(app): State<App>, Query(q): Query<HashMap<String, String>>
             bmc::Collection::failed()
         }
     };
-    let schedule_slow = result.up && !result.blocked && result.errors == 0;
-    let body = metrics::render(name, result, start.elapsed().as_secs_f64());
-    if target.slow_drive_wear && schedule_slow {
-        let mut due = target.slow_due.lock().await;
-        if due.is_none_or(|last| last.elapsed() >= Duration::from_secs(1800)) {
-            *due = Some(std::time::Instant::now());
-            let target = Arc::clone(target);
-            let name = name.clone();
-            let inflight = Arc::clone(&app.slow_inflight);
-            tokio::spawn(async move {
-                let Ok(_slow_guard) = target.slow_lock.try_lock() else {
-                    return;
-                };
-                let result = tokio::time::timeout(
-                    Duration::from_secs(90),
-                    bmc::collect_drive_wear(&name, &target, &inflight),
-                )
-                .await
-                .unwrap_or_else(|_| bmc::Collection::failed());
-                *target.slow_snapshot.lock().await = Some(metrics::render_slow(&name, result));
-            });
-        }
+    if target.slow_drive_wear
+        && result.up
+        && !result.blocked
+        && !result.failed_groups.contains("drives")
+    {
+        tokio::spawn(refresh_drive_wear(
+            name.clone(),
+            Arc::clone(target),
+            Arc::clone(&app.slow_inflight),
+            app.slow_interval,
+        ));
     }
+    let body = metrics::render(name, result, start.elapsed().as_secs_f64());
     (
         StatusCode::OK,
         [(
@@ -322,10 +355,16 @@ async fn main() -> Result<()> {
     if !bind.ip().is_loopback() {
         bail!("exporter must bind to loopback");
     }
+    let enable_b300_drive_wear = std::env::var("REDFISH_EXPORTER_B300_DRIVE_WEAR")
+        .unwrap_or_else(|_| "false".into())
+        .parse::<bool>()
+        .context("invalid REDFISH_EXPORTER_B300_DRIVE_WEAR")?;
+    let slow_interval = if enable_b300_drive_wear { 7200 } else { 1800 };
     let app = App {
-        targets: Arc::new(load_targets(Path::new(&path))?),
+        targets: Arc::new(load_targets(Path::new(&path), enable_b300_drive_wear)?),
         inflight: Arc::new(Semaphore::new(4)),
         slow_inflight: Arc::new(Semaphore::new(1)),
+        slow_interval: Duration::from_secs(slow_interval),
     };
     start_gpu_memory(&app)?;
     tracing::info!(targets = app.targets.len(), %bind, "read-only Redfish exporter starting");
@@ -350,6 +389,34 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn queued_wear_batch_does_not_lock_bmc_or_start_its_cadence() {
+        let target = Arc::new(
+            bmc::Target::new(
+                serde_json::from_value(serde_json::json!({
+                    "address":"10.0.0.1", "username":"fixture", "password":"fixture",
+                    "slow_drive_wear":true
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let slot = Arc::new(Semaphore::new(0));
+        let worker = tokio::spawn(refresh_drive_wear(
+            "fixture".into(),
+            target.clone(),
+            slot.clone(),
+            Duration::from_secs(7200),
+        ));
+        tokio::task::yield_now().await;
+        assert!(target.slow_lock.try_lock().is_err());
+        assert!(target.scrape_lock.try_lock().is_ok());
+        assert!(target.slow_due.lock().await.is_none());
+        slot.close();
+        worker.await.unwrap();
+        assert!(target.slow_snapshot.lock().await.is_none());
+    }
+
+    #[tokio::test]
     async fn slow_endpoint_is_cache_only_even_when_bmc_lock_is_held() {
         let target = Arc::new(bmc::Target::new(serde_json::from_value(serde_json::json!({
             "address":"10.0.0.1","username":"fixture","password":"fixture", "slow_drive_wear":true
@@ -359,6 +426,7 @@ mod tests {
             targets: Arc::new(HashMap::from([("fixture".into(), target.clone())])),
             inflight: Arc::new(Semaphore::new(1)),
             slow_inflight: Arc::new(Semaphore::new(1)),
+            slow_interval: Duration::from_secs(1800),
         };
         let response = tokio::time::timeout(
             Duration::from_millis(100),
@@ -382,6 +450,7 @@ mod tests {
             targets: Arc::new(HashMap::from([("fixture".into(), t.clone())])),
             inflight: Arc::new(Semaphore::new(1)),
             slow_inflight: Arc::new(Semaphore::new(1)),
+            slow_interval: Duration::from_secs(1800),
         };
         let query = || Query(HashMap::from([("target".into(), "fixture".into())]));
         assert_eq!(
@@ -424,6 +493,7 @@ mod tests {
             targets: Arc::new(HashMap::from([("cpu-a".into(), Arc::new(target))])),
             inflight: Arc::new(Semaphore::new(1)),
             slow_inflight: Arc::new(Semaphore::new(1)),
+            slow_interval: Duration::from_secs(1800),
         };
         let check = || BindingCheck {
             target: "cpu-a".into(),

@@ -141,6 +141,12 @@ impl FetchError {
 }
 
 impl Target {
+    pub fn enable_b300_drive_wear(&mut self) {
+        if self.profile == Profile::AsrockrackB3008u16x {
+            self.slow_drive_wear = true;
+        }
+    }
+
     pub fn address(&self) -> &str {
         &self.address
     }
@@ -162,7 +168,7 @@ impl Target {
                 .and_then(|items| items.iter_mut().find(|c| c["id"] == "drive_wear"))
             {
                 capability["state"] = serde_json::json!("conditional");
-                capability["reason"] = serde_json::json!("IDC opt-in slow snapshot; separate source timestamp, 1800s cadence and 90s budget");
+                capability["reason"] = serde_json::json!("IDC opt-in slow snapshot with its own observation timestamp and 90s active batch budget");
             }
         }
         value
@@ -378,21 +384,18 @@ fn path_group(path: &str) -> &'static str {
     }
 }
 
+const B300_THERMAL: &str = "/redfish/v1/Chassis/BMC_0/Thermal";
+const B300_FANS: &str = "/redfish/v1/Chassis/BMC_0/ThermalSubsystem/Fans";
+
 /// A slow batch never takes the lock for the entire batch. A waiting fast scrape
 /// gets the fair mutex before the next slow GET. At most one 30s request delays it.
-pub async fn collect_drive_wear(name: &str, target: &Target, inflight: &Semaphore) -> Collection {
+pub async fn collect_drive_wear(name: &str, target: &Target) -> Collection {
     let mut out = Collection::failed();
     out.errors = 0;
     if !target.slow_drive_wear || target.blocked().await.is_some() {
         return out;
     }
     let read = |path: String| async move {
-        // Acquire the independent slow budget before taking this BMC lock.
-        // Targets waiting for the slow slot must not obstruct baseline scrapes.
-        let _slow_permit = inflight
-            .acquire()
-            .await
-            .map_err(|_| FetchError::Transport)?;
         let _guard = target.scrape_lock.lock().await;
         target
             .get_with_timeout(&path, &Semaphore::new(1), Duration::from_secs(30))
@@ -401,8 +404,17 @@ pub async fn collect_drive_wear(name: &str, target: &Target, inflight: &Semaphor
     let storage =
         match read("/redfish/v1/Systems/System_0/Storage?$expand=*($levels=1)".into()).await {
             Ok(value) => value,
-            Err(_) => {
+            Err(error) => {
                 out.errors = 1;
+                tracing::warn!(
+                    target = name,
+                    reason = error.reason(),
+                    "slow Redfish storage read failed"
+                );
+                if matches!(error, FetchError::Http(403)) {
+                    target.note_forbidden().await;
+                    out.blocked = true;
+                }
                 return out;
             }
         };
@@ -464,6 +476,7 @@ pub struct Collection {
     requests: usize,
     budget_exhausted: bool,
     pub failed_groups: std::collections::BTreeSet<&'static str>,
+    pub b300_thermal_groups: bool,
 }
 
 impl Collection {
@@ -476,6 +489,7 @@ impl Collection {
             requests: 0,
             budget_exhausted: false,
             failed_groups: Default::default(),
+            b300_thermal_groups: false,
         }
     }
 
@@ -486,12 +500,25 @@ impl Collection {
         inflight: &Semaphore,
         path: &str,
     ) -> Option<Value> {
+        self.fetch_group(name, target, inflight, path, path_group(path), false)
+            .await
+    }
+
+    async fn fetch_group(
+        &mut self,
+        name: &str,
+        target: &Target,
+        inflight: &Semaphore,
+        path: &str,
+        group: &'static str,
+        allow_not_found: bool,
+    ) -> Option<Value> {
         if self.blocked {
-            self.failed_groups.insert(path_group(path));
+            self.failed_groups.insert(group);
             return None;
         }
         if self.requests >= MAX_REQUESTS_PER_SCRAPE {
-            self.failed_groups.insert(path_group(path));
+            self.failed_groups.insert(group);
             if !self.budget_exhausted {
                 self.errors = self.errors.saturating_add(1);
                 self.budget_exhausted = true;
@@ -501,8 +528,9 @@ impl Collection {
         self.requests += 1;
         match target.get(path, inflight).await {
             Ok(value) => Some(value),
+            Err(FetchError::Http(404)) if allow_not_found => None,
             Err(error) => {
-                self.failed_groups.insert(path_group(path));
+                self.failed_groups.insert(group);
                 tracing::warn!(
                     target = name,
                     path,
@@ -703,6 +731,7 @@ async fn collect_cpu_chassis(
 }
 
 pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Collection {
+    let b300_thermal_groups = target.profile == Profile::AsrockrackB3008u16x;
     if let Some(forbidden) = target.blocked().await {
         return Collection {
             samples: Vec::new(),
@@ -712,6 +741,7 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
             requests: 0,
             budget_exhausted: false,
             failed_groups: ["health", "compute", "drives", "network", "power", "gpu"].into(),
+            b300_thermal_groups,
         };
     }
     let mut out = Collection {
@@ -722,6 +752,7 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
         requests: 1,
         budget_exhausted: false,
         failed_groups: Default::default(),
+        b300_thermal_groups,
     };
     let probe = tokio::time::timeout(
         Duration::from_secs(10),
@@ -761,7 +792,7 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
     );
     metrics::system(&mut out.samples, &system);
 
-    if target.profile != Profile::AsrockrackB3008u16x {
+    if !b300_thermal_groups {
         collect_cpu(name, target, inflight, &mut out, &system).await;
         return out;
     }
@@ -843,10 +874,14 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
         metrics::manager(&mut out.samples, &v);
     }
     if let Some(v) = out
-        .fetch(name, target, inflight, "/redfish/v1/Chassis/BMC_0/Thermal")
+        .fetch_group(name, target, inflight, B300_THERMAL, "thermal", true)
         .await
     {
         metrics::thermal(&mut out.samples, &v);
+    } else if !out.failed_groups.contains("thermal") {
+        if let Some(fans) = sensors::directory(name, target, inflight, &mut out, B300_FANS).await {
+            metrics::fan_count(&mut out.samples, fans.len());
+        }
     }
     if let Some(v) = out
         .fetch(
@@ -939,6 +974,19 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
             metrics::gpu_memory(&mut out.samples, &v);
         }
     }
+    if let Some(v) = out
+        .fetch_group(
+            name,
+            target,
+            inflight,
+            "/redfish/v1/Chassis/BMC_0/Power",
+            "chassis_input",
+            true,
+        )
+        .await
+    {
+        metrics::b300_chassis_input_power(&mut out.samples, &v);
+    }
     out
 }
 
@@ -993,13 +1041,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut target = Target::mock(&format!("http://{addr}/"));
-        assert!(
-            !collect_drive_wear("fixture", &target, &Semaphore::new(1))
-                .await
-                .up
-        );
+        assert!(!collect_drive_wear("fixture", &target).await.up);
         target.slow_drive_wear = true;
-        let result = collect_drive_wear("fixture", &target, &Semaphore::new(1)).await;
+        let result = collect_drive_wear("fixture", &target).await;
         assert!(result.up);
         assert_eq!(result.errors, 0);
         let text = metrics::render_slow("fixture", result);
@@ -1035,23 +1079,6 @@ mod tests {
         slow.await.unwrap();
         assert_eq!(*order.lock().await, vec!["fast", "slow"]);
     }
-    #[tokio::test]
-    async fn saturated_slow_budget_does_not_take_baseline_bmc_lock() {
-        let mut target = Target::mock("http://127.0.0.1:1/");
-        target.slow_drive_wear = true;
-        let target = Arc::new(target);
-        let worker_target = target.clone();
-        let (started, ready) = tokio::sync::oneshot::channel();
-        let worker = tokio::spawn(async move {
-            started.send(()).unwrap();
-            collect_drive_wear("fixture", &worker_target, &Semaphore::new(0)).await
-        });
-        ready.await.unwrap();
-        tokio::task::yield_now().await;
-        assert!(target.scrape_lock.try_lock().is_ok());
-        worker.abort();
-    }
-
     #[test]
     fn rejects_ssrf_and_unsafe_references() {
         for address in [
@@ -1241,6 +1268,74 @@ mod tests {
         assert!(first.blocked && second.blocked);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(first.samples.is_empty() && second.samples.is_empty());
+    }
+
+    #[tokio::test]
+    async fn b300_fan_pages_and_board_power_are_independent() {
+        for complete in [true, false] {
+            let app = Router::new().fallback(get(move |uri: Uri| async move {
+                use axum::response::IntoResponse;
+                let value = match uri.path() {
+                    B300_THERMAL => return StatusCode::NOT_FOUND.into_response(),
+                    B300_FANS => {
+                        let start = if uri.query().is_none() { 0 } else { 50 };
+                        let end = if start == 0 {
+                            50
+                        } else if complete {
+                            76
+                        } else {
+                            75
+                        };
+                        let mut page = json!({
+                            "Members@odata.count": 76,
+                            "Members": (start..end).map(|id| json!({
+                                "@odata.id": format!("{B300_FANS}/{id}")
+                            })).collect::<Vec<_>>(),
+                        });
+                        if start == 0 {
+                            page["Members@odata.nextLink"] = json!(format!("{B300_FANS}?$skip=50"));
+                        }
+                        page
+                    }
+                    "/redfish/v1/Chassis/HGX_Chassis_0/EnvironmentMetrics" => {
+                        json!({"PowerWatts": {"Reading": 2337}})
+                    }
+                    path if path.starts_with(B300_FANS) => {
+                        panic!("inventory fallback must not request fan details");
+                    }
+                    _ => json!({"Members": []}),
+                };
+                Json(value).into_response()
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let target = Target::mock(&format!("http://{addr}/"));
+            let result = collect("B300-38", &target, &Semaphore::new(1)).await;
+            assert_eq!(result.failed_groups.contains("thermal"), !complete);
+            let rendered = metrics::render("B300-38", result, 1.0);
+            assert!(rendered.contains("redfish_board_power_watts{target=\"B300-38\"} 2337"));
+            for (group, success) in [
+                ("power", true),
+                ("thermal", complete),
+                ("fan_details", false),
+            ] {
+                let value = u8::from(success);
+                assert!(
+                    rendered.contains(&format!(
+                        "redfish_group_success{{target=\"B300-38\",group=\"{group}\"}} {value}"
+                    )),
+                    "{rendered}"
+                );
+            }
+            assert_eq!(
+                rendered.contains("redfish_fan_count{target=\"B300-38\"} 76"),
+                complete
+            );
+            assert!(!rendered.contains("redfish_fan_rpm{"));
+            assert!(!rendered.contains("redfish_fan_health{"));
+            server.abort();
+        }
     }
 
     #[tokio::test]
