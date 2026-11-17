@@ -830,38 +830,48 @@ pub fn board_power(out: &mut Vec<Metric>, value: &Value) {
 }
 
 pub fn b300_chassis_input_power(out: &mut Vec<Metric>, value: &Value) {
+    chassis_input_power(out, value, 12, |name| {
+        name.strip_prefix("PWR_PSU_")
+            .and_then(|name| name.strip_suffix("_PIN"))
+            .is_some_and(|slot| matches!(slot.as_bytes(), [b'L' | b'R', b'1'..=b'6']))
+    });
+}
+
+pub fn tyan_chassis_input_power(out: &mut Vec<Metric>, value: &Value) {
+    chassis_input_power(out, value, 2, |name| {
+        matches!(name, "PSU0_PIN" | "PSU1_PIN")
+    });
+}
+
+fn chassis_input_power(
+    out: &mut Vec<Metric>,
+    value: &Value,
+    expected: usize,
+    is_input: impl Fn(&str) -> bool,
+) {
     let Some(entries) = value["PowerSupplies"].as_array() else {
         return;
     };
-    // This BMC places both PIN and POUT readings in PowerInputWatts.
+    // These BMCs expose both PIN and POUT entries in PowerInputWatts.
     let mut slots = BTreeMap::new();
     for entry in entries {
-        let Some(slot) = entry["Name"]
-            .as_str()
-            .and_then(|name| name.strip_prefix("PWR_PSU_"))
-            .and_then(|name| name.strip_suffix("_PIN"))
-        else {
+        let Some(name) = entry["Name"].as_str().filter(|name| is_input(name)) else {
             continue;
         };
-        if !matches!(slot.as_bytes(), [b'L' | b'R', b'1'..=b'6']) {
-            continue;
-        }
         let Some(watts) =
             number(&entry["PowerInputWatts"]).filter(|watts| watts.is_finite() && *watts >= 0.)
         else {
             return;
         };
-        if slots.insert(slot, watts).is_some() {
+        if slots.insert(name, watts).is_some() {
             return;
         }
     }
-    if slots.len() == 12 {
-        add(
-            out,
-            "redfish_chassis_input_power_watts",
-            vec![],
-            slots.values().sum(),
-        );
+    if slots.len() == expected {
+        let total: f64 = slots.values().sum();
+        if total.is_finite() {
+            add(out, "redfish_chassis_input_power_watts", vec![], total);
+        }
     }
 }
 
@@ -989,8 +999,9 @@ fn escape_label(value: &str) -> String {
 pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
     let observed = epoch();
     let b300_thermal_groups = result.b300_thermal_groups;
+    let chassis_input = b300_thermal_groups || result.tyan_chassis_input;
     let sample_group = |name| match (b300_thermal_groups, name) {
-        (true, "redfish_chassis_input_power_watts") => Some("chassis_input"),
+        (_, "redfish_chassis_input_power_watts") if chassis_input => Some("chassis_input"),
         (true, "redfish_fan_count" | "redfish_temperature_celsius") => Some("thermal"),
         (true, "redfish_fan_health" | "redfish_fan_rpm") => Some("fan_details"),
         _ => group(name),
@@ -1009,10 +1020,11 @@ pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
     for id in ["health", "compute", "drives", "network", "power", "gpu"]
         .into_iter()
         .chain(
-            ["thermal", "fan_details", "chassis_input"]
+            ["thermal", "fan_details"]
                 .into_iter()
                 .filter(|_| b300_thermal_groups),
         )
+        .chain(chassis_input.then_some("chassis_input"))
         .filter(|_| baseline)
     {
         let successful = result.up
@@ -1162,6 +1174,28 @@ mod tests {
         response["PowerSupplies"].as_array_mut().unwrap().remove(0);
         b300_chassis_input_power(&mut out, &response);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn tyan_input_requires_both_pin_readings_without_duplicates() {
+        let first = json!({"Name":"PSU0_PIN","PowerInputWatts":360});
+        let second = json!({"Name":"PSU1_PIN","PowerInputWatts":370});
+        let output = json!({"Name":"PSU0_POUT","PowerInputWatts":330});
+        let mut out = Vec::new();
+        for entries in [
+            vec![first.clone(), output.clone()],
+            vec![first.clone(), first.clone(), second.clone()],
+            vec![
+                first.clone(),
+                json!({"Name":"PSU1_PIN","PowerInputWatts":null}),
+            ],
+        ] {
+            tyan_chassis_input_power(&mut out, &json!({"PowerSupplies": entries}));
+            assert!(out.is_empty());
+        }
+        tyan_chassis_input_power(&mut out, &json!({"PowerSupplies": [first, second, output]}));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].value, 730.);
     }
 
     #[test]
