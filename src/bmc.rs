@@ -477,6 +477,7 @@ pub struct Collection {
     budget_exhausted: bool,
     pub failed_groups: std::collections::BTreeSet<&'static str>,
     pub b300_thermal_groups: bool,
+    pub tyan_chassis_input: bool,
 }
 
 impl Collection {
@@ -490,6 +491,7 @@ impl Collection {
             budget_exhausted: false,
             failed_groups: Default::default(),
             b300_thermal_groups: false,
+            tyan_chassis_input: false,
         }
     }
 
@@ -715,6 +717,8 @@ async fn collect_cpu_chassis(
                 if !metrics::power(&mut out.samples, &value) {
                     out.failed_groups.insert("power");
                     out.errors = out.errors.saturating_add(1);
+                } else if target.profile == Profile::TyanB8037 {
+                    metrics::tyan_chassis_input_power(&mut out.samples, &value);
                 }
             }
         }
@@ -732,6 +736,7 @@ async fn collect_cpu_chassis(
 
 pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Collection {
     let b300_thermal_groups = target.profile == Profile::AsrockrackB3008u16x;
+    let tyan_chassis_input = target.profile == Profile::TyanB8037;
     if let Some(forbidden) = target.blocked().await {
         return Collection {
             samples: Vec::new(),
@@ -742,6 +747,7 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
             budget_exhausted: false,
             failed_groups: ["health", "compute", "drives", "network", "power", "gpu"].into(),
             b300_thermal_groups,
+            tyan_chassis_input,
         };
     }
     let mut out = Collection {
@@ -753,6 +759,7 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
         budget_exhausted: false,
         failed_groups: Default::default(),
         b300_thermal_groups,
+        tyan_chassis_input,
     };
     let probe = tokio::time::timeout(
         Duration::from_secs(10),
@@ -1660,8 +1667,8 @@ mod tests {
                         "/redfish/v1/Systems/Self/Memory/DIMM0" => json!({"Name":"DIMM0","CapacityMiB":32768,"Status":{"Health":"OK"}}),
                         "/redfish/v1/Systems/Self/Storage" => json!({"Members":[]}),
                         "/redfish/v1/Managers/Self" => json!({"FirmwareVersion":"2.05.0","Model":"AMI"}),
-                        "/redfish/v1/Chassis/Self" => if has_sensors {json!({"Status":{"Health":"OK"},"Sensors":{"@odata.id":"/redfish/v1/Chassis/Self/Sensors"},"Power":{"@odata.id":"/redfish/v1/Chassis/Self/Power"},"Thermal":{"@odata.id":"/redfish/v1/Chassis/Self/Thermal"}})} else {json!({"Status":{"Health":"OK"}})},
-                        "/redfish/v1/Chassis/Self/Power" => json!({"PowerControl":[{"PowerConsumedWatts":420}],"PowerSupplies":[{"Name":"PSU1","Status":{"Health":"OK"},"PowerOutputWatts":225}]}),
+                        "/redfish/v1/Chassis/Self" => if has_sensors {json!({"Status":{"Health":"OK"},"Sensors":{"@odata.id":"/redfish/v1/Chassis/Self/Sensors"},"Power":{"@odata.id":"/redfish/v1/Chassis/Self/Power"},"Thermal":{"@odata.id":"/redfish/v1/Chassis/Self/Thermal"}})} else {json!({"Status":{"Health":"OK"},"Power":{"@odata.id":"/redfish/v1/Chassis/Self/Power"}})},
+                        "/redfish/v1/Chassis/Self/Power" => json!({"PowerControl":[{"PowerConsumedWatts":0}],"PowerSupplies":[{"Name":"PSU0_PIN","PowerInputWatts":360},{"Name":"PSU1_PIN","PowerInputWatts":370},{"Name":"PSU0_POUT","PowerInputWatts":330}]}),
                         "/redfish/v1/Chassis/Self/Thermal" => json!({"Fans":[{"Name":"FAN1","Reading":4400,"ReadingUnits":"RPM","Status":{"Health":"OK"}}],"Temperatures":[{"Name":"Inlet","ReadingCelsius":28,"PhysicalContext":"Intake"}]}),
                         "/redfish/v1/Chassis/Self/Sensors" => json!({"Members":[{"@odata.id":"/redfish/v1/Chassis/Self/Sensors/1"}]}),
                         "/redfish/v1/Chassis/Self/Sensors/1" => json!({"Name":"CPU Temp","ReadingType":"Temperature","ReadingUnits":"Cel","Reading":46,"Status":{"Health":"OK"}}),
@@ -1692,11 +1699,17 @@ mod tests {
                 output.contains("redfish_sensor_temperature_celsius"),
                 has_sensors
             );
-            assert_eq!(output.contains("redfish_chassis_power_watts"), has_sensors);
-            assert_eq!(
-                output.contains("redfish_sensor_power_supply_entry_count"),
-                has_sensors
-            );
+            assert!(output.contains("redfish_chassis_power_watts"));
+            assert!(output.contains("redfish_sensor_power_supply_entry_count"));
+            if profile == Profile::TyanB8037 {
+                assert!(output.contains("redfish_chassis_input_power_watts{target=\"CPU-01\"} 730"));
+                assert!(output.contains(
+                    "redfish_group_success{target=\"CPU-01\",group=\"chassis_input\"} 1"
+                ));
+            } else {
+                assert!(!output.contains("redfish_chassis_input_power_watts"));
+                assert!(!output.contains("group=\"chassis_input\""));
+            }
             assert!(!output.contains("redfish_psu_"));
             assert_eq!(output.contains("redfish_fan_rpm"), has_sensors);
             let paths = paths.lock().expect("paths");
