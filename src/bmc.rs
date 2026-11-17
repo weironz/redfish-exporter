@@ -974,6 +974,19 @@ pub async fn collect(name: &str, target: &Target, inflight: &Semaphore) -> Colle
             metrics::gpu_memory(&mut out.samples, &v);
         }
     }
+    if let Some(v) = out
+        .fetch_group(
+            name,
+            target,
+            inflight,
+            "/redfish/v1/Chassis/BMC_0/Power",
+            "chassis_input",
+            true,
+        )
+        .await
+    {
+        metrics::b300_chassis_input_power(&mut out.samples, &v);
+    }
     out
 }
 

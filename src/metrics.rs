@@ -829,6 +829,42 @@ pub fn board_power(out: &mut Vec<Metric>, value: &Value) {
     }
 }
 
+pub fn b300_chassis_input_power(out: &mut Vec<Metric>, value: &Value) {
+    let Some(entries) = value["PowerSupplies"].as_array() else {
+        return;
+    };
+    // This BMC places both PIN and POUT readings in PowerInputWatts.
+    let mut slots = BTreeMap::new();
+    for entry in entries {
+        let Some(slot) = entry["Name"]
+            .as_str()
+            .and_then(|name| name.strip_prefix("PWR_PSU_"))
+            .and_then(|name| name.strip_suffix("_PIN"))
+        else {
+            continue;
+        };
+        if !matches!(slot.as_bytes(), [b'L' | b'R', b'1'..=b'6']) {
+            continue;
+        }
+        let Some(watts) =
+            number(&entry["PowerInputWatts"]).filter(|watts| watts.is_finite() && *watts >= 0.)
+        else {
+            return;
+        };
+        if slots.insert(slot, watts).is_some() {
+            return;
+        }
+    }
+    if slots.len() == 12 {
+        add(
+            out,
+            "redfish_chassis_input_power_watts",
+            vec![],
+            slots.values().sum(),
+        );
+    }
+}
+
 pub fn gpu_slots(out: &mut Vec<Metric>, count: usize) {
     add(out, "redfish_gpu_count", vec![], count as f64);
 }
@@ -954,6 +990,7 @@ pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
     let observed = epoch();
     let b300_thermal_groups = result.b300_thermal_groups;
     let sample_group = |name| match (b300_thermal_groups, name) {
+        (true, "redfish_chassis_input_power_watts") => Some("chassis_input"),
         (true, "redfish_fan_count" | "redfish_temperature_celsius") => Some("thermal"),
         (true, "redfish_fan_health" | "redfish_fan_rpm") => Some("fan_details"),
         _ => group(name),
@@ -972,7 +1009,7 @@ pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
     for id in ["health", "compute", "drives", "network", "power", "gpu"]
         .into_iter()
         .chain(
-            ["thermal", "fan_details"]
+            ["thermal", "fan_details", "chassis_input"]
                 .into_iter()
                 .filter(|_| b300_thermal_groups),
         )
@@ -1084,6 +1121,48 @@ pub(crate) fn render_gpu_memory(samples: &[Metric]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn b300_input_requires_distinct_complete_pin_readings() {
+        let mut out = Vec::new();
+        let mut entries: Vec<_> = ['L', 'R']
+            .into_iter()
+            .flat_map(|side| {
+                (1..=6).map(move |slot| {
+                json!({"Name":format!("PWR_PSU_{side}{slot}_PIN"),"PowerInputWatts": 400})
+            })
+            })
+            .collect();
+        entries.push(json!({"Name":"PWR_PSU_L1_POUT","PowerInputWatts": 375}));
+        let mut response = json!({
+            "PowerControl": [{
+                "PhysicalContext": "Intake",
+                "PowerConsumedWatts": null,
+                "PowerMetrics": {"CurConsumedWatts": 4965, "AverageConsumedWatts": 5349}
+            }],
+            "PowerSupplies": entries
+        });
+        b300_chassis_input_power(&mut out, &response);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "redfish_chassis_input_power_watts");
+        assert_eq!(out[0].value, 4800.);
+        out.clear();
+        let first = response["PowerSupplies"][0].clone();
+        for invalid in [Value::Null, json!(-1), json!("NaN")] {
+            response["PowerSupplies"][0]["PowerInputWatts"] = invalid;
+            b300_chassis_input_power(&mut out, &response);
+        }
+        response["PowerSupplies"][0] = first.clone();
+        response["PowerSupplies"]
+            .as_array_mut()
+            .unwrap()
+            .push(first);
+        b300_chassis_input_power(&mut out, &response);
+        response["PowerSupplies"].as_array_mut().unwrap().remove(0);
+        response["PowerSupplies"].as_array_mut().unwrap().remove(0);
+        b300_chassis_input_power(&mut out, &response);
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn rolling_cpu_members_keep_individual_time_and_complete_aggregates_use_oldest_source() {
