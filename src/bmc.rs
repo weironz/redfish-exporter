@@ -141,6 +141,12 @@ impl FetchError {
 }
 
 impl Target {
+    pub fn enable_b300_drive_wear(&mut self) {
+        if self.profile == Profile::AsrockrackB3008u16x {
+            self.slow_drive_wear = true;
+        }
+    }
+
     pub fn address(&self) -> &str {
         &self.address
     }
@@ -162,7 +168,7 @@ impl Target {
                 .and_then(|items| items.iter_mut().find(|c| c["id"] == "drive_wear"))
             {
                 capability["state"] = serde_json::json!("conditional");
-                capability["reason"] = serde_json::json!("IDC opt-in slow snapshot; separate source timestamp, 1800s cadence and 90s budget");
+                capability["reason"] = serde_json::json!("IDC opt-in slow snapshot with its own observation timestamp and 90s active batch budget");
             }
         }
         value
@@ -383,19 +389,13 @@ const B300_FANS: &str = "/redfish/v1/Chassis/BMC_0/ThermalSubsystem/Fans";
 
 /// A slow batch never takes the lock for the entire batch. A waiting fast scrape
 /// gets the fair mutex before the next slow GET. At most one 30s request delays it.
-pub async fn collect_drive_wear(name: &str, target: &Target, inflight: &Semaphore) -> Collection {
+pub async fn collect_drive_wear(name: &str, target: &Target) -> Collection {
     let mut out = Collection::failed();
     out.errors = 0;
     if !target.slow_drive_wear || target.blocked().await.is_some() {
         return out;
     }
     let read = |path: String| async move {
-        // Acquire the independent slow budget before taking this BMC lock.
-        // Targets waiting for the slow slot must not obstruct baseline scrapes.
-        let _slow_permit = inflight
-            .acquire()
-            .await
-            .map_err(|_| FetchError::Transport)?;
         let _guard = target.scrape_lock.lock().await;
         target
             .get_with_timeout(&path, &Semaphore::new(1), Duration::from_secs(30))
@@ -404,8 +404,17 @@ pub async fn collect_drive_wear(name: &str, target: &Target, inflight: &Semaphor
     let storage =
         match read("/redfish/v1/Systems/System_0/Storage?$expand=*($levels=1)".into()).await {
             Ok(value) => value,
-            Err(_) => {
+            Err(error) => {
                 out.errors = 1;
+                tracing::warn!(
+                    target = name,
+                    reason = error.reason(),
+                    "slow Redfish storage read failed"
+                );
+                if matches!(error, FetchError::Http(403)) {
+                    target.note_forbidden().await;
+                    out.blocked = true;
+                }
                 return out;
             }
         };
@@ -1019,13 +1028,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut target = Target::mock(&format!("http://{addr}/"));
-        assert!(
-            !collect_drive_wear("fixture", &target, &Semaphore::new(1))
-                .await
-                .up
-        );
+        assert!(!collect_drive_wear("fixture", &target).await.up);
         target.slow_drive_wear = true;
-        let result = collect_drive_wear("fixture", &target, &Semaphore::new(1)).await;
+        let result = collect_drive_wear("fixture", &target).await;
         assert!(result.up);
         assert_eq!(result.errors, 0);
         let text = metrics::render_slow("fixture", result);
@@ -1061,23 +1066,6 @@ mod tests {
         slow.await.unwrap();
         assert_eq!(*order.lock().await, vec!["fast", "slow"]);
     }
-    #[tokio::test]
-    async fn saturated_slow_budget_does_not_take_baseline_bmc_lock() {
-        let mut target = Target::mock("http://127.0.0.1:1/");
-        target.slow_drive_wear = true;
-        let target = Arc::new(target);
-        let worker_target = target.clone();
-        let (started, ready) = tokio::sync::oneshot::channel();
-        let worker = tokio::spawn(async move {
-            started.send(()).unwrap();
-            collect_drive_wear("fixture", &worker_target, &Semaphore::new(0)).await
-        });
-        ready.await.unwrap();
-        tokio::task::yield_now().await;
-        assert!(target.scrape_lock.try_lock().is_ok());
-        worker.abort();
-    }
-
     #[test]
     fn rejects_ssrf_and_unsafe_references() {
         for address in [
