@@ -843,6 +843,12 @@ pub fn tyan_chassis_input_power(out: &mut Vec<Metric>, value: &Value) {
     });
 }
 
+pub fn asrockrack_1u12e_chassis_input_power(out: &mut Vec<Metric>, value: &Value) {
+    chassis_input_power(out, value, 2, |name| {
+        matches!(name, "PWR_PSU1_PIN" | "PWR_PSU2_PIN")
+    });
+}
+
 fn chassis_input_power(
     out: &mut Vec<Metric>,
     value: &Value,
@@ -999,7 +1005,7 @@ fn escape_label(value: &str) -> String {
 pub fn render(target: &str, mut result: Collection, duration: f64) -> String {
     let observed = epoch();
     let b300_thermal_groups = result.b300_thermal_groups;
-    let chassis_input = b300_thermal_groups || result.tyan_chassis_input;
+    let chassis_input = b300_thermal_groups || result.cpu_chassis_input;
     let sample_group = |name| match (b300_thermal_groups, name) {
         (_, "redfish_chassis_input_power_watts") if chassis_input => Some("chassis_input"),
         (true, "redfish_fan_count" | "redfish_temperature_celsius") => Some("thermal"),
